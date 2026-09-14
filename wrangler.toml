@@ -5,7 +5,7 @@ compatibility_date = "2024-09-23"
 [[d1_databases]]
 binding = "DB"
 database_name = "referral_bot_db"
-database_id = "REPLACE_AFTER_RUNNING_wrangler_d1_create"
+database_id = "4024ef69-c838-416d-a271-0de88829c12f"
 
 # Non-secret configuration. Secrets (BOT_TOKEN, WEBHOOK_SECRET,
 # ADMIN_EXPORT_TOKEN) are set separately with `wrangler secret put`
