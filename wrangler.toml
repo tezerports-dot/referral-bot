@@ -1,0 +1,19 @@
+name = "referral-bot"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "referral_bot_db"
+database_id = "REPLACE_AFTER_RUNNING_wrangler_d1_create"
+
+# Non-secret configuration. Secrets (BOT_TOKEN, WEBHOOK_SECRET,
+# ADMIN_EXPORT_TOKEN) are set separately with `wrangler secret put`
+# and must never be committed here.
+[vars]
+BOT_USERNAME = "REPLACE_WITH_YOUR_BOT_USERNAME_NO_AT"
+GROUP1_CHAT_ID = "REPLACE_ME"
+GROUP2_CHAT_ID = "REPLACE_ME"
+CHANNEL_CHAT_ID = "REPLACE_ME"
+PREMIUM_GROUP_CHAT_ID = "REPLACE_ME"
+ADMIN_IDS = "REPLACE_WITH_COMMA_SEPARATED_ADMIN_TELEGRAM_USER_IDS"
