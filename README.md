@@ -7,38 +7,58 @@ which is then purchased with **200 Telegram Stars**.
 
 ## Upgrading from the previous version
 
-If you already have a deployed bot with data, read this first — two steps are
-breaking.
+**This repo auto-deploys.** A Cloudflare Workers Git integration builds every
+push; merging to `main` ships to production. Two of the changes below are
+breaking, so do them in this order — done in this sequence there is no
+downtime, because each step is safe against the version still running.
+
+**1. Migrate the database first.** It only adds tables and columns, so the
+currently deployed code keeps working unchanged afterwards.
 
 ```bash
 npm install
-npm test                      # 36 checks, no network or account needed
-npm run db:migrate:remote     # migrates your live D1 database in place
+npm test                      # 36 checks, offline, no account needed
+npm run db:migrate:remote
 ```
 
-Then:
+The migration seeds your three existing chat IDs into the new `required_chats`
+table and backfills `join_requests` from the old boolean flags, so nothing
+changes for users.
 
-1. **Required chats moved out of `wrangler.toml` into the database.**
-   `GROUP1_CHAT_ID`, `GROUP2_CHAT_ID` and `CHANNEL_CHAT_ID` are gone. The
-   migration seeds your three existing chat IDs into the `required_chats`
-   table, so nothing changes for users. From now on use `/addchat` and
-   `/removechat`.
+**2. Re-register the webhook, with `secret_token`.** The currently deployed
+version ignores the header, so adding it now is harmless; the new version
+*requires* it. Doing this before the deploy avoids a window where every update
+is rejected.
 
-2. **The webhook now also requires Telegram's secret-token header.** Re-register
-   the webhook with `secret_token` or the bot will reject every update:
+```bash
+curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook\
+?url=https://<your-worker>.workers.dev/webhook/<WEBHOOK_SECRET>\
+&secret_token=<WEBHOOK_SECRET>\
+&allowed_updates=[\"message\",\"chat_join_request\",\"pre_checkout_query\",\"my_chat_member\"]"
+```
 
-   ```bash
-   curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook\
-   ?url=https://<your-worker>.workers.dev/webhook/<WEBHOOK_SECRET>\
-   &secret_token=<WEBHOOK_SECRET>\
-   &allowed_updates=[\"message\",\"chat_join_request\",\"pre_checkout_query\",\"my_chat_member\"]"
-   ```
+`allowed_updates` matters: `chat_join_request` and `my_chat_member` are **not**
+delivered by default, and `pre_checkout_query` is needed for Stars payments.
+Setting the list replaces it wholesale, so pass every type you need.
 
-   `allowed_updates` matters: `chat_join_request` and `my_chat_member` are **not**
-   delivered by default.
+**3. Set `PREMIUM_GROUP_CHAT_ID`** in `wrangler.toml` — it ships as
+`REPLACE_ME`, and until it holds the real chat ID nobody can receive a premium
+invite link. Also confirm `QUALIFY_THRESHOLD` and `PREMIUM_PRICE_STARS`.
 
-3. Set `PREMIUM_GROUP_CHAT_ID` in `wrangler.toml` (it ships as `REPLACE_ME`) and
-   `npm run deploy`. Until it is set, nobody can receive a premium invite link.
+**4. Deploy** — merge the PR, or `npm run deploy` directly.
+
+**5. Check `/chats` in a DM to the bot** to confirm the three migrated chats are
+listed and active, then `/stats`.
+
+If you deploy before step 1, queries hit columns that do not exist yet. If you
+deploy before step 2, the bot rejects every Telegram update until the webhook
+is re-registered — recoverable (Telegram retries), but avoidable.
+
+### What changed for operators
+
+`GROUP1_CHAT_ID`, `GROUP2_CHAT_ID` and `CHANNEL_CHAT_ID` no longer exist. The
+required list is managed at runtime with `/addchat` and `/removechat` — no
+redeploy to change it.
 
 ## Managing the required groups and channels
 
