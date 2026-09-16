@@ -1,12 +1,19 @@
 import type { Api } from "grammy";
 import type { Env } from "./types";
-import { getUserById, incrementVerifiedReferralCount, markQualified, tryClaimVerification } from "./db";
+import { qualifyThreshold } from "./types";
+import {
+  getUserById,
+  incrementVerifiedReferralCount,
+  tryClaimQualification,
+  tryClaimVerification,
+} from "./db";
+import { notifyAdmins, sendPremiumInvoice } from "./payments";
 
 /**
- * Call this after any event that could complete a user's verification
- * (contact shared, or any of the three join-request flags set). Safe to
- * call redundantly -- it's a no-op unless this call is the one that
- * actually completes all conditions.
+ * Call this after any event that could complete a user's verification (contact
+ * shared, or a join request to any active required chat). Safe to call
+ * redundantly -- it is a no-op unless this specific call is the one that
+ * completes every condition.
  */
 export async function tryVerifyAndQualify(env: Env, api: Api, userId: number): Promise<void> {
   const claimed = await tryClaimVerification(env.DB, userId);
@@ -14,61 +21,40 @@ export async function tryVerifyAndQualify(env: Env, api: Api, userId: number): P
 
   const user = await getUserById(env.DB, userId);
   const referrerId = user?.referred_by;
-  if (!referrerId) return; // should be impossible given tryClaimVerification's WHERE clause
+  if (!referrerId) return; // impossible given tryClaimVerification's WHERE clause
 
-  const newCount = await incrementVerifiedReferralCount(env.DB, referrerId);
+  await incrementVerifiedReferralCount(env.DB, referrerId);
 
-  if (newCount === 100) {
-    await handleQualification(env, api, referrerId);
-  }
+  // Re-checked on every increment rather than on an exact threshold match, so a
+  // referrer who somehow passes the threshold without this branch running (a
+  // racing increment, a manual DB correction, a raised-then-lowered threshold)
+  // still qualifies on their next referral instead of being stranded.
+  const newlyQualified = await tryClaimQualification(env.DB, referrerId, qualifyThreshold(env));
+  if (newlyQualified) await announceQualification(env, api, referrerId);
 }
 
-async function handleQualification(env: Env, api: Api, referrerId: number): Promise<void> {
+async function announceQualification(env: Env, api: Api, referrerId: number): Promise<void> {
   const referrer = await getUserById(env.DB, referrerId);
-  if (!referrer || referrer.qualified) return;
-
-  let inviteLink: string;
-  try {
-    const invite = await api.createChatInviteLink(env.PREMIUM_GROUP_CHAT_ID, {
-      name: `qualified-${referrerId}`,
-      member_limit: 1,
-    });
-    inviteLink = invite.invite_link;
-  } catch (err) {
-    console.error(`Failed to create premium invite link for ${referrerId}:`, err);
-    return; // Leave qualified=0 so this can be retried by a future call.
-  }
-
-  const wasNewlyQualified = await markQualified(env.DB, referrerId, inviteLink);
-  if (!wasNewlyQualified) return; // someone else's concurrent call already handled this
+  const threshold = qualifyThreshold(env);
 
   try {
     await api.sendMessage(
       referrerId,
-      "🎉 Congratulations! You've reached 100 verified referrals and unlocked the Premium Opportunity.\n\n" +
-        `Here is your personal, one-time invitation link to the Premium Group:\n${inviteLink}\n\n` +
-        "This link is unique to you and can only be used once."
+      `🎉 Congratulations! You've reached ${threshold} verified referrals and unlocked the Premium Opportunity.\n\n` +
+        "Complete the one-time payment below to receive your personal invite link to the Premium Group.\n\n" +
+        "You can always return to this with /premium."
     );
+    await sendPremiumInvoice(env, api, referrerId);
   } catch (err) {
-    console.error(`Failed to DM qualified user ${referrerId}:`, err);
+    // Qualification stays recorded either way -- the user can run /premium to
+    // get a fresh invoice, and an admin can run /resendpremium.
+    console.error(`Failed to send premium invoice to ${referrerId}:`, err);
   }
-
-  const adminIds = (env.ADMIN_IDS || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
 
   const draft =
     "📢 DRAFT ANNOUNCEMENT (review before posting to the official group/channel)\n\n" +
-    `${referrer.first_name ?? "A user"} (id: ${referrerId}) just reached 100 verified referrals ` +
+    `${referrer?.first_name ?? "A user"} (id: ${referrerId}) just reached ${threshold} verified referrals ` +
     "and qualified for the Premium Opportunity!";
 
-  for (const adminId of adminIds) {
-    try {
-      await api.sendMessage(Number(adminId), draft);
-    } catch (err) {
-      // Admin may not have started the bot yet -- don't let this block qualification.
-      console.error(`Failed to notify admin ${adminId}:`, err);
-    }
-  }
+  await notifyAdmins(env, api, draft);
 }

@@ -1,158 +1,215 @@
 # Referral / Verification Bot
 
-Cloudflare Workers + D1, built to the spec: 100 verified direct referrals per
-user unlocks the Premium Opportunity, verification requires contact-sharing
-plus join requests to Group 1, Group 2, and the Channel.
+Cloudflare Workers + D1. Users verify by sharing contact and sending join
+requests to an **admin-managed list of groups/channels** (any number, changeable
+at runtime). **200** verified direct referrals unlock the Premium Opportunity,
+which is then purchased with **200 Telegram Stars**.
 
-## 0. Prerequisites
+## Upgrading from the previous version
 
-- Node.js 18+ installed locally
-- A free Cloudflare account (https://dash.cloudflare.com/sign-up)
-- Your bot token from @BotFather
-- Your own numeric Telegram user ID, from **@userinfobot** (you'll need this for admin commands)
-
-## 1. Install
+If you already have a deployed bot with data, read this first — two steps are
+breaking.
 
 ```bash
-cd referral-bot
 npm install
-npx wrangler login
+npm test                      # 36 checks, no network or account needed
+npm run db:migrate:remote     # migrates your live D1 database in place
 ```
 
-`wrangler login` opens a browser to connect your Cloudflare account.
+Then:
 
-## 2. Create the D1 database
+1. **Required chats moved out of `wrangler.toml` into the database.**
+   `GROUP1_CHAT_ID`, `GROUP2_CHAT_ID` and `CHANNEL_CHAT_ID` are gone. The
+   migration seeds your three existing chat IDs into the `required_chats`
+   table, so nothing changes for users. From now on use `/addchat` and
+   `/removechat`.
+
+2. **The webhook now also requires Telegram's secret-token header.** Re-register
+   the webhook with `secret_token` or the bot will reject every update:
+
+   ```bash
+   curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook\
+   ?url=https://<your-worker>.workers.dev/webhook/<WEBHOOK_SECRET>\
+   &secret_token=<WEBHOOK_SECRET>\
+   &allowed_updates=[\"message\",\"chat_join_request\",\"pre_checkout_query\",\"my_chat_member\"]"
+   ```
+
+   `allowed_updates` matters: `chat_join_request` and `my_chat_member` are **not**
+   delivered by default.
+
+3. Set `PREMIUM_GROUP_CHAT_ID` in `wrangler.toml` (it ships as `REPLACE_ME`) and
+   `npm run deploy`. Until it is set, nobody can receive a premium invite link.
+
+## Managing the required groups and channels
+
+There is no fixed number and no redeploy needed. As an admin, DM the bot:
+
+| Command | Effect |
+|---|---|
+| `/chats` | List every required chat, active and removed, with invite links |
+| `/addchat <chat_id>` | Add (or re-activate) a chat |
+| `/addchat` | Same, but sent *inside* the group you want to add |
+| `/removechat <chat_id>` | Stop requiring a chat |
+
+When you add a chat the bot calls `getChat` to confirm it can see it, then
+mints an **approval-required invite link** itself (`creates_join_request`) and
+shows that link to users on `/start` and `/status`. You never have to create or
+circulate links by hand — which also closes the old failure mode where a
+normal invite link leaking let people skip verification.
+
+The bot must be an administrator in the chat with **Invite Users via Link**
+before `/addchat` will work. Add it as an admin and it will DM you the chat ID
+and a ready-to-paste `/addchat` command automatically.
+
+### What happens when you rotate the list
+
+- **Adding** a chat immediately applies to everyone not yet verified. Users who
+  are **already verified stay verified** — verification is sticky, so rotating
+  the list never wipes out earned referral counts.
+- **Removing** a chat stops it being required immediately. The row is kept
+  (shown as ⚪ in `/chats`), never deleted.
+- **Re-adding** a chat restores every user's earlier progress for it, because
+  join requests are recorded per `(user, chat)` independently of the current
+  list.
+- An **empty** list verifies nobody. This is deliberate — a bug that cleared
+  the list would otherwise verify your entire user base at once.
+
+## How verification works
+
+A user becomes verified only when a single atomic `UPDATE` finds all of:
+
+- they arrived through someone's referral link (`referred_by IS NOT NULL`)
+- they shared their contact, and that phone number is not linked to any other
+  account
+- they have a join request recorded for **every currently active** required chat
+
+Every condition is evaluated inside that one statement (`tryClaimVerification`
+in `src/db.ts`), so there is no read-then-write window for a concurrent webhook
+delivery to slip through. Only the call that actually flips `verified` 0→1
+returns true, and only that call credits the referrer — which is what makes
+Telegram's webhook retries safe.
+
+Users can check where they stand at any time with `/status`.
+
+## Premium: 200 referrals, 200 Stars
+
+At `QUALIFY_THRESHOLD` verified referrals the referrer is marked qualified and
+sent a Telegram Stars invoice for `PREMIUM_PRICE_STARS`. On successful payment
+the bot mints a **single-use** invite link to `PREMIUM_GROUP_CHAT_ID` and DMs
+it. Admins get a draft announcement to review — it is never auto-posted.
+
+Both numbers are `[vars]` in `wrangler.toml`; change them and redeploy.
+
+Qualification is claimed with `verified_referral_count >= threshold` inside the
+same statement that sets the flag, so a count that overshoots the threshold (a
+racing increment, a manual correction, a threshold you later lower) still
+qualifies instead of being stranded. Payment is recorded idempotently against
+the Telegram charge ID, so a redelivered `successful_payment` update cannot
+mint a second invite link.
+
+If link creation fails after a successful payment, the payment stays recorded
+and admins are notified; `/premium` (user) or `/resendpremium <id>` (admin)
+retries delivery without charging again.
+
+## Admin commands
+
+| Command | Effect |
+|---|---|
+| `/stats` | Registered / verified / qualified / paid counts, required-chat count, price |
+| `/referrals <user_id>` | One user's count, qualified and paid status, direct referrals |
+| `/chats`, `/addchat`, `/removechat` | Manage the required list (above) |
+| `/resendpremium <user_id>` | Re-issue a paid user's invite link |
+| `/refund <user_id>` | Refund their Stars payment and reset their premium state |
+
+Plus `GET /admin/export.csv` with header `X-Admin-Token: <ADMIN_EXPORT_TOKEN>`:
 
 ```bash
-npx wrangler d1 create referral_bot_db
+curl -H "X-Admin-Token: <your token>" \
+  "https://<your-worker>.workers.dev/admin/export.csv" -o users-export.csv
 ```
 
-This prints a `database_id`. Copy it into `wrangler.toml`, replacing
-`REPLACE_AFTER_RUNNING_wrangler_d1_create`.
+Keyset pagination internally, so memory stays flat at ~1.5M rows. **Phone
+numbers are excluded by design.** Values that begin with `=`, `+`, `-` or `@`
+are quoted so Excel and Sheets cannot execute them as formulas.
 
-## 3. Apply the schema
+For full raw backups use Cloudflare's own dump instead, no Worker involved:
 
 ```bash
-npm run db:init:remote
+npx wrangler d1 export referral_bot_db --remote --output=backup.sql
 ```
 
-(`npm run db:init` targets your local dev database instead, if you want to
-test with `wrangler dev` first.)
+## Fresh install
 
-## 4. Set the plain config values
+1. `npm install && npx wrangler login`
+2. `npx wrangler d1 create referral_bot_db`, copy the `database_id` into
+   `wrangler.toml`
+3. `npm run db:init:remote`
+4. Set `[vars]`: `BOT_USERNAME`, `ADMIN_IDS`, `PREMIUM_GROUP_CHAT_ID`,
+   `QUALIFY_THRESHOLD`, `PREMIUM_PRICE_STARS`
+5. Secrets — never put these in `wrangler.toml`:
+   ```bash
+   npx wrangler secret put BOT_TOKEN           # from @BotFather
+   npx wrangler secret put WEBHOOK_SECRET      # openssl rand -hex 24
+   npx wrangler secret put ADMIN_EXPORT_TOKEN  # openssl rand -hex 24
+   ```
+6. `npm run deploy`
+7. Register the webhook (see the `curl` under *Upgrading*, step 2)
+8. Add the bot as an admin to each group/channel, then `/addchat` each one
 
-Edit `wrangler.toml` `[vars]`:
+## Hardening notes
 
-- `BOT_USERNAME` — your bot's username, no `@` (used to build referral links)
-- `ADMIN_IDS` — your numeric Telegram ID(s), comma-separated if more than one
+- Verification and qualification are each a single atomic statement — no
+  check-then-act races.
+- One phone number verifies at most one account, enforced by a partial unique
+  index as well as in the `UPDATE`'s `WHERE` clause.
+- Invoice payloads carry the buyer's user ID and are re-checked against the
+  authenticated sender at pre-checkout, so an invoice cannot be paid by a
+  different account.
+- Webhook requests must match both the secret in the URL path and Telegram's
+  `X-Telegram-Bot-Api-Secret-Token` header. Both comparisons are
+  length-independent, as is the admin export token check.
+- All bot replies are sent as plain text with no `parse_mode`, so
+  attacker-controlled chat titles and names cannot inject markup.
+- Required-chat mutations are admin-only and go through `getChat` first.
 
-Leave `GROUP1_CHAT_ID`, `GROUP2_CHAT_ID`, `CHANNEL_CHAT_ID`, and
-`PREMIUM_GROUP_CHAT_ID` as `REPLACE_ME` for now — see step 7.
-
-## 5. Set secrets
-
-These must never go in `wrangler.toml` since that file can end up in git.
+## Testing
 
 ```bash
-npx wrangler secret put BOT_TOKEN
-# paste your BotFather token when prompted
-
-npx wrangler secret put WEBHOOK_SECRET
-# paste a random string, e.g. generate one with: openssl rand -hex 24
-
-npx wrangler secret put ADMIN_EXPORT_TOKEN
-# paste another random string (protects the CSV export endpoint)
+npm test          # 36 assertions against real SQLite, offline
+npm run typecheck
 ```
 
-## 6. Deploy
+`tests/sql.test.mjs` runs the atomic statements from `src/db.ts` against
+in-memory SQLite, covering rotation, grandfathering, the empty-list guard,
+webhook-retry double-claims, phone reuse, and threshold overshoot.
+`tests/migration.test.mjs` applies the migration to a populated v1 database and
+checks nothing is lost. Both assert the SQL still matches `src/db.ts`, so they
+fail if the source drifts.
 
-```bash
-npm run deploy
-```
+## Not built
 
-Note the `https://referral-bot.<your-subdomain>.workers.dev` URL it prints.
+- **Aadhaar collection.** Requested, not implemented — see the note below.
+- **No web dashboard.** Admin access is bot commands plus the CSV endpoint.
 
-## 7. Set up the three Telegram destinations
+### On the Aadhaar requirement
 
-For **Group 1**, **Group 2**, and the **Channel**:
+A Telegram bot cannot verify that an Aadhaar number is real or that it belongs
+to the person typing it. Aadhaar authentication and offline eKYC are only
+available to entities licensed by UIDAI, so a free-text form would collect the
+numbers without validating any of them — it would not establish the identity
+link it is meant to establish.
 
-1. Make each one private (no public @username).
-2. Create an invite link with **"Request Admin Approval"** turned on
-   (Manage Chat → Invite Links → Create New Link). This is what makes
-   Telegram fire `chat_join_request` events — privacy alone doesn't.
-3. Add your bot as an admin with **"Invite Users via Link"** permission
-   (full admin is simplest while you're setting this up).
-4. Copy each chat's numeric ID (forward any message from the chat to
-   **@userinfobot**, or check `chat.id` in the bot's logs after adding it).
-5. Put those three IDs into `wrangler.toml` `[vars]`, and your **Premium
-   Group**'s chat ID into `PREMIUM_GROUP_CHAT_ID` (the bot needs admin
-   there too, to generate personal invite links later).
-6. Re-deploy: `npm run deploy`.
+Storing the numbers is the bigger problem. UIDAI requires Aadhaar numbers to be
+held encrypted in a reference-keyed Aadhaar Data Vault by entities permitted to
+store them at all, and *Puttaswamy* (2018) struck down the provision that let
+private companies demand Aadhaar as a condition of service. A plaintext column
+of Aadhaar numbers next to phone numbers and names is also a standing
+identity-fraud risk for the users in it.
 
-Only ever share the one approval-required invite link per chat with users —
-if a different, non-approval link leaks, it lets people bypass verification.
-
-## 8. Register the webhook with Telegram
-
-```bash
-curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook?url=https://<your-worker>.workers.dev/webhook/<WEBHOOK_SECRET>"
-```
-
-Replace `<BOT_TOKEN>`, `<your-worker>`, and `<WEBHOOK_SECRET>` with your
-actual values. You should get back `{"ok":true,"result":true,...}`.
-
-## 9. Test it
-
-1. DM your bot `/start` — you should get the welcome message with your
-   referral link and a "Share my contact" button.
-2. Tap the button.
-3. Send join requests to Group 1, Group 2, and the Channel via their
-   approval-required links.
-4. You should now be `verified` in the database. Test the referral chain
-   by opening your `https://t.me/<bot>?start=<code>` link from a second
-   Telegram account and repeating steps 1-3.
-5. As an admin, DM the bot `/stats` and `/referrals <telegram_user_id>` to
-   confirm counts are updating.
-
-## Admin tools
-
-- `/stats` — total registered, verified, qualified counts
-- `/referrals <telegram_user_id>` — a user's verified count, qualified
-  status, and their direct referrals
-- `GET /admin/export.csv` (header `X-Admin-Token: <ADMIN_EXPORT_TOKEN>`) —
-  streams every user as CSV:
-
-  ```bash
-  curl -H "X-Admin-Token: <your token>" \
-    "https://<your-worker>.workers.dev/admin/export.csv" \
-    -o users-export.csv
-  ```
-
-  This uses keyset pagination internally so it scales to the full ~1.5M
-  users without loading them all into memory at once — Excel and Google
-  Sheets both open CSV natively, so this covers the "Excel-compatible
-  export" requirement directly.
-
-### A note on full-database exports and true `.xlsx`
-
-Building a real `.xlsx` workbook (not CSV) for ~1.5M rows inside a Worker
-isn't a good idea on the free tier — Workers have a per-request memory/CPU
-budget, and holding a spreadsheet that size in memory risks hitting it.
-Two better options when you specifically need `.xlsx` rather than CSV:
-
-1. Pull the CSV via the endpoint above, then convert locally with a small
-   Node script (a few lines with the `xlsx` npm package) — happy to write
-   that script whenever you want it.
-2. For full raw backups, `wrangler d1 export referral_bot_db --remote
-   --output=backup.sql` dumps the whole database directly from Cloudflare's
-   side, no Worker involved.
-
-## What's intentionally not built yet
-
-- The **Premium Group** invite link generation, referrer DM, and admin
-  draft-announcement all fire automatically at 100 verified referrals —
-  but the announcement is only drafted and sent to admins, never
-  auto-posted, per the spec.
-- No web dashboard — admin access is via bot commands and the CSV
-  endpoint. Say the word if you'd like a small password-protected HTML
-  dashboard on top of these same D1 queries.
+The workable shape, if you need real KYC, is a licensed provider (DigiLocker
+offline eKYC, or a KYC vendor such as Signzy, Digio, Karza or HyperVerge): the
+user completes verification on the provider's flow, and the bot stores only
+`kyc_verified` plus the provider's reference ID — never the Aadhaar number.
+That gates verification exactly as intended without the bot ever holding the
+number. The verification gate in `src/db.ts` is already a single atomic
+statement, so adding one more condition to it is a small change.

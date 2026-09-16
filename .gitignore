@@ -1,0 +1,9 @@
+node_modules/
+.wrangler/
+dist/
+*.log
+.dev.vars
+.env
+backup.sql
+users-export*.csv
+.DS_Store

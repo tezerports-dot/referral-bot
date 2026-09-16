@@ -8,19 +8,28 @@ export interface UserRow {
   first_name: string | null;
   phone_number: string | null;
   contact_shared: number;
-  group1_request: number;
-  group2_request: number;
-  channel_request: number;
   verified: number;
   verified_at: string | null;
   verified_referral_count: number;
   qualified: number;
   qualified_at: string | null;
+  premium_paid: number;
+  premium_paid_at: string | null;
+  premium_charge_id: string | null;
   premium_invite_link: string | null;
   created_at: string;
 }
 
-export type RequestColumn = "group1_request" | "group2_request" | "channel_request";
+export interface RequiredChatRow {
+  chat_id: number;
+  title: string | null;
+  kind: string;
+  invite_link: string | null;
+  active: number;
+  added_at: string;
+  added_by: number | null;
+  deactivated_at: string | null;
+}
 
 export async function getUserById(db: D1Database, id: number): Promise<UserRow | null> {
   const row = await db.prepare("SELECT * FROM users WHERE telegram_user_id = ?").bind(id).first<UserRow>();
@@ -33,10 +42,10 @@ export async function getUserByReferralCode(db: D1Database, code: string): Promi
 }
 
 /**
- * Creates the user if they don't already exist. Safe to call on every
- * /start, including repeated ones -- referred_by is only ever set at
- * creation time and is never overwritten, which is what guarantees a
- * referred user can only ever belong to one direct referrer.
+ * Creates the user if they don't already exist. Safe to call on every /start,
+ * including repeated ones -- referred_by is only ever set at creation time and
+ * is never overwritten, which is what guarantees a referred user can only ever
+ * belong to one direct referrer.
  */
 export async function createUserIfNotExists(
   db: D1Database,
@@ -51,15 +60,15 @@ export async function createUserIfNotExists(
   // Self-referral guard.
   let referredBy: number | null = proposedReferrerId === id ? null : proposedReferrerId;
 
-  // If the referrer isn't a real registered user, drop the reference
-  // rather than violate the foreign key constraint.
+  // If the referrer isn't a real registered user, drop the reference rather
+  // than violate the foreign key constraint.
   if (referredBy !== null) {
     const referrer = await getUserById(db, referredBy);
     if (!referrer) referredBy = null;
   }
 
-  // Referral codes are random; collisions are astronomically unlikely but
-  // we still guard against them instead of trusting probability.
+  // Referral codes are random; collisions are astronomically unlikely but we
+  // still guard against them instead of trusting probability.
   let code = generateReferralCode();
   for (let attempt = 0; attempt < 5; attempt++) {
     const clash = await getUserByReferralCode(db, code);
@@ -81,19 +90,114 @@ export async function createUserIfNotExists(
   return created;
 }
 
-export async function setContactShared(db: D1Database, id: number, phone: string): Promise<void> {
-  await db
-    .prepare("UPDATE users SET contact_shared = 1, phone_number = ? WHERE telegram_user_id = ?")
-    .bind(phone, id)
+export type ContactResult = "ok" | "phone_taken" | "no_user";
+
+/**
+ * Records a shared contact. The uniqueness check lives inside the UPDATE's
+ * WHERE clause rather than in a separate SELECT, so two accounts submitting the
+ * same phone number concurrently cannot both succeed. Re-sharing the same
+ * number from the same account stays a successful no-op.
+ */
+export async function setContactShared(db: D1Database, id: number, phone: string): Promise<ContactResult> {
+  const res = await db
+    .prepare(
+      `UPDATE users SET contact_shared = 1, phone_number = ?
+       WHERE telegram_user_id = ?
+         AND NOT EXISTS (
+               SELECT 1 FROM users other
+               WHERE other.phone_number = ? AND other.telegram_user_id <> ?
+             )`
+    )
+    .bind(phone, id, phone, id)
     .run();
+
+  if ((res.meta.changes ?? 0) > 0) return "ok";
+  return (await getUserById(db, id)) ? "phone_taken" : "no_user";
+}
+
+// ---- Required chats (admin-managed, unlimited, rotatable) ----
+
+export async function listRequiredChats(db: D1Database, activeOnly = true): Promise<RequiredChatRow[]> {
+  const sql = activeOnly
+    ? "SELECT * FROM required_chats WHERE active = 1 ORDER BY added_at ASC"
+    : "SELECT * FROM required_chats ORDER BY active DESC, added_at ASC";
+  const res = await db.prepare(sql).all<RequiredChatRow>();
+  return res.results ?? [];
 }
 
 /**
+ * Adds a chat to the required set, or reactivates one that was removed
+ * earlier. Returns the row as it now stands.
+ */
+export async function addRequiredChat(
+  db: D1Database,
+  chatId: number,
+  title: string | null,
+  kind: string,
+  addedBy: number
+): Promise<RequiredChatRow | null> {
+  await db
+    .prepare(
+      `INSERT INTO required_chats (chat_id, title, kind, active, added_by)
+       VALUES (?, ?, ?, 1, ?)
+       ON CONFLICT(chat_id) DO UPDATE SET
+         active = 1,
+         deactivated_at = NULL,
+         title = COALESCE(excluded.title, required_chats.title),
+         kind = excluded.kind`
+    )
+    .bind(chatId, title, kind, addedBy)
+    .run();
+
+  return db.prepare("SELECT * FROM required_chats WHERE chat_id = ?").bind(chatId).first<RequiredChatRow>();
+}
+
+/**
+ * Deactivates a required chat. The row is kept (not deleted) so that existing
+ * join_requests rows stay interpretable, and so re-adding the chat later
+ * restores every user's prior progress for it automatically.
+ */
+export async function deactivateRequiredChat(db: D1Database, chatId: number): Promise<boolean> {
+  const res = await db
+    .prepare("UPDATE required_chats SET active = 0, deactivated_at = datetime('now') WHERE chat_id = ? AND active = 1")
+    .bind(chatId)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+export async function isRequiredChat(db: D1Database, chatId: number): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT 1 FROM required_chats WHERE chat_id = ? AND active = 1")
+    .bind(chatId)
+    .first();
+  return row !== null;
+}
+
+/** The active required chats this user has not yet sent a join request to. */
+export async function getMissingRequiredChats(db: D1Database, userId: number): Promise<RequiredChatRow[]> {
+  const res = await db
+    .prepare(
+      `SELECT rc.* FROM required_chats rc
+       WHERE rc.active = 1
+         AND NOT EXISTS (
+               SELECT 1 FROM join_requests jr
+               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id
+             )
+       ORDER BY rc.added_at ASC`
+    )
+    .bind(userId)
+    .all<RequiredChatRow>();
+  return res.results ?? [];
+}
+
+// ---- Join requests ----
+
+/**
  * Records that this Telegram user ID sent a join request to this chat ID.
- * Idempotent: Telegram may redeliver the same webhook update on retry, and
- * the (telegram_user_id, chat_id) primary key makes a duplicate a no-op.
- * This table is independent of whether the user has registered with the
- * bot yet, so a join request sent before /start is never lost.
+ * Idempotent: Telegram may redeliver the same webhook update on retry, and the
+ * (telegram_user_id, chat_id) primary key makes a duplicate a no-op. Rows are
+ * written regardless of whether the user has registered with the bot yet, so a
+ * join request sent before /start is never lost.
  */
 export async function recordJoinRequest(db: D1Database, userId: number, chatId: number): Promise<void> {
   await db
@@ -105,49 +209,19 @@ export async function recordJoinRequest(db: D1Database, userId: number, chatId: 
     .run();
 }
 
-export async function hasJoinRequest(db: D1Database, userId: number, chatId: number): Promise<boolean> {
-  const row = await db
-    .prepare("SELECT 1 FROM join_requests WHERE telegram_user_id = ? AND chat_id = ?")
-    .bind(userId, chatId)
-    .first();
-  return row !== null;
-}
-
-export async function setRequestFlag(db: D1Database, userId: number, column: RequestColumn): Promise<void> {
-  // `column` only ever comes from the fixed RequestColumn union defined in
-  // this file, never from user input, so this interpolation is safe.
-  await db.prepare(`UPDATE users SET ${column} = 1 WHERE telegram_user_id = ?`).bind(userId).run();
-}
+// ---- Verification ----
 
 /**
- * Backfills request flags for a user from any join_requests rows that
- * arrived before they ran /start (order of operations shouldn't matter).
- */
-export async function backfillJoinRequestFlags(
-  db: D1Database,
-  userId: number,
-  chatIds: { group1: number | null; group2: number | null; channel: number | null }
-): Promise<void> {
-  const checks: Array<[RequestColumn, number | null]> = [
-    ["group1_request", chatIds.group1],
-    ["group2_request", chatIds.group2],
-    ["channel_request", chatIds.channel],
-  ];
-  for (const [column, chatId] of checks) {
-    if (!chatId) continue;
-    if (await hasJoinRequest(db, userId, chatId)) {
-      await setRequestFlag(db, userId, column);
-    }
-  }
-}
-
-/**
- * Atomically checks every verification condition and flips verified 0->1
- * in a single statement. Returns true only for the call that actually
- * performed the transition -- concurrent/duplicate calls (e.g. Telegram
- * webhook retries racing each other) will see 0 rows changed and return
- * false, which is what prevents a referrer's count from being incremented
- * more than once for the same referred user.
+ * Atomically checks every verification condition against the *current* active
+ * required-chat set and flips verified 0->1 in a single statement.
+ *
+ * Returns true only for the call that actually performed the transition.
+ * Concurrent or duplicate calls (Telegram webhook retries racing each other)
+ * see 0 rows changed and return false, which is what prevents a referrer's
+ * count being incremented more than once for the same referred user.
+ *
+ * The `EXISTS` guard means an empty required set never auto-verifies everyone:
+ * with no active chats the NOT EXISTS below would be vacuously true.
  */
 export async function tryClaimVerification(db: D1Database, userId: number): Promise<boolean> {
   const res = await db
@@ -158,34 +232,80 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
          AND verified = 0
          AND contact_shared = 1
          AND referred_by IS NOT NULL
-         AND group1_request = 1
-         AND group2_request = 1
-         AND channel_request = 1`
+         AND EXISTS (SELECT 1 FROM required_chats WHERE active = 1)
+         AND NOT EXISTS (
+               SELECT 1 FROM required_chats rc
+               WHERE rc.active = 1
+                 AND NOT EXISTS (
+                       SELECT 1 FROM join_requests jr
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id
+                     )
+             )`
     )
-    .bind(userId)
+    .bind(userId, userId)
     .run();
   return (res.meta.changes ?? 0) > 0;
 }
 
-export async function incrementVerifiedReferralCount(db: D1Database, referrerId: number): Promise<number> {
+export async function incrementVerifiedReferralCount(db: D1Database, referrerId: number): Promise<void> {
   await db
     .prepare("UPDATE users SET verified_referral_count = verified_referral_count + 1 WHERE telegram_user_id = ?")
     .bind(referrerId)
     .run();
-  const row = await getUserById(db, referrerId);
-  return row?.verified_referral_count ?? 0;
 }
 
-/** Idempotent: only actually updates (and thus should only be acted on) the first time. */
-export async function markQualified(db: D1Database, userId: number, inviteLink: string): Promise<boolean> {
+/**
+ * Atomically claims qualification for a referrer who has reached the
+ * threshold. Uses `>=` rather than an exact match and reads the count inside
+ * the same statement that flips the flag, so a concurrent increment can never
+ * cause the threshold crossing to be missed or double-counted.
+ */
+export async function tryClaimQualification(db: D1Database, userId: number, threshold: number): Promise<boolean> {
   const res = await db
     .prepare(
-      `UPDATE users SET qualified = 1, qualified_at = datetime('now'), premium_invite_link = ?
-       WHERE telegram_user_id = ? AND qualified = 0`
+      `UPDATE users SET qualified = 1, qualified_at = datetime('now')
+       WHERE telegram_user_id = ? AND qualified = 0 AND verified_referral_count >= ?`
     )
-    .bind(inviteLink, userId)
+    .bind(userId, threshold)
     .run();
   return (res.meta.changes ?? 0) > 0;
+}
+
+// ---- Premium payment ----
+
+/** Idempotent: returns true only for the call that actually recorded payment. */
+export async function markPremiumPaid(db: D1Database, userId: number, chargeId: string): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `UPDATE users SET premium_paid = 1, premium_paid_at = datetime('now'), premium_charge_id = ?
+       WHERE telegram_user_id = ? AND premium_paid = 0`
+    )
+    .bind(chargeId, userId)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+export async function setRequiredChatInviteLink(db: D1Database, chatId: number, link: string): Promise<void> {
+  await db.prepare("UPDATE required_chats SET invite_link = ? WHERE chat_id = ?").bind(link, chatId).run();
+}
+
+export async function setPremiumInviteLink(db: D1Database, userId: number, link: string): Promise<void> {
+  await db
+    .prepare("UPDATE users SET premium_invite_link = ? WHERE telegram_user_id = ?")
+    .bind(link, userId)
+    .run();
+}
+
+/** Clears payment state so a refunded user must pay again for a new link. */
+export async function clearPremiumPayment(db: D1Database, userId: number): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE users SET premium_paid = 0, premium_paid_at = NULL, premium_charge_id = NULL,
+                        premium_invite_link = NULL
+       WHERE telegram_user_id = ?`
+    )
+    .bind(userId)
+    .run();
 }
 
 // ---- Admin queries ----
@@ -205,6 +325,11 @@ export async function countQualifiedUsers(db: D1Database): Promise<number> {
   return row?.c ?? 0;
 }
 
+export async function countPaidUsers(db: D1Database): Promise<number> {
+  const row = await db.prepare("SELECT COUNT(*) as c FROM users WHERE premium_paid = 1").first<{ c: number }>();
+  return row?.c ?? 0;
+}
+
 export async function getDirectReferrals(db: D1Database, referrerId: number, limit = 100): Promise<UserRow[]> {
   const res = await db
     .prepare("SELECT * FROM users WHERE referred_by = ? ORDER BY created_at DESC LIMIT ?")
@@ -213,17 +338,7 @@ export async function getDirectReferrals(db: D1Database, referrerId: number, lim
   return res.results ?? [];
 }
 
-export async function getQualifiedUsers(db: D1Database, afterId = 0, limit = 100): Promise<UserRow[]> {
-  const res = await db
-    .prepare(
-      "SELECT * FROM users WHERE qualified = 1 AND telegram_user_id > ? ORDER BY telegram_user_id ASC LIMIT ?"
-    )
-    .bind(afterId, limit)
-    .all<UserRow>();
-  return res.results ?? [];
-}
-
-/** Keyset pagination (not OFFSET) so export performance doesn't degrade as the table grows toward ~1.5M rows. */
+/** Keyset pagination (not OFFSET) so export performance doesn't degrade as the table grows. */
 export async function getUsersPage(db: D1Database, afterId: number, pageSize: number): Promise<UserRow[]> {
   const res = await db
     .prepare("SELECT * FROM users WHERE telegram_user_id > ? ORDER BY telegram_user_id ASC LIMIT ?")

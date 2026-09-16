@@ -10,10 +10,13 @@ database_id = "4024ef69-c838-416d-a271-0de88829c12f"
 # Non-secret configuration. Secrets (BOT_TOKEN, WEBHOOK_SECRET,
 # ADMIN_EXPORT_TOKEN) are set separately with `wrangler secret put`
 # and must never be committed here.
+#
+# The list of required groups/channels is NOT here -- it lives in the
+# required_chats table and is managed at runtime with /addchat and
+# /removechat, so it can be rotated without a redeploy.
 [vars]
 BOT_USERNAME = "Betbazaarbot"
-GROUP1_CHAT_ID = "-1004493745060"
-GROUP2_CHAT_ID = "-1004365591682"
-CHANNEL_CHAT_ID = "-1004309711460"
 PREMIUM_GROUP_CHAT_ID = "REPLACE_ME"
 ADMIN_IDS = "8729957009"
+QUALIFY_THRESHOLD = "200"
+PREMIUM_PRICE_STARS = "200"
