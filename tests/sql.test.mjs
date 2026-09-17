@@ -56,12 +56,6 @@ const SQL = {
                SELECT 1 FROM users other
                WHERE other.phone_normalized = ? AND other.telegram_user_id <> ?
              )`,
-  setReferrer: `UPDATE users SET referred_by = ?
-       WHERE telegram_user_id = ?
-         AND referred_by IS NULL
-         AND verified = 0
-         AND telegram_user_id <> ?
-         AND EXISTS (SELECT 1 FROM users r WHERE r.telegram_user_id = ?)`,
   markPremiumPaid: `UPDATE users SET premium_paid = 1, premium_paid_at = datetime('now'), premium_charge_id = ?
        WHERE telegram_user_id = ? AND premium_paid = 0`,
 };
@@ -381,49 +375,6 @@ test("the same number written two different ways still collides", () => {
   addUser(db, 1, { phone: "+91 12345 67890" });
   // Different raw spelling, same digits -- the old raw-column index missed this.
   assert.throws(() => addUser(db, 2, { phone: "911234567890" }), /UNIQUE/i);
-});
-
-console.log("\nReferrer assignment");
-
-const setRef = (db, uid, rid) => db.prepare(SQL.setReferrer).run(rid, uid, rid, rid).changes > 0;
-
-test("a referrer can be set once", () => {
-  const db = freshDb();
-  addUser(db, 1);
-  addUser(db, 2);
-  assert.equal(setRef(db, 2, 1), true);
-  assert.equal(db.prepare("SELECT referred_by r FROM users WHERE telegram_user_id = 2").get().r, 1);
-});
-
-test("a referrer cannot be changed once set", () => {
-  const db = freshDb();
-  addUser(db, 1);
-  addUser(db, 2);
-  addUser(db, 3);
-  assert.equal(setRef(db, 3, 1), true);
-  assert.equal(setRef(db, 3, 2), false, "changing referrer would move credit after the fact");
-  assert.equal(db.prepare("SELECT referred_by r FROM users WHERE telegram_user_id = 3").get().r, 1);
-});
-
-test("nobody can refer themselves", () => {
-  const db = freshDb();
-  addUser(db, 1);
-  assert.equal(setRef(db, 1, 1), false);
-});
-
-test("an unknown referrer is rejected", () => {
-  const db = freshDb();
-  addUser(db, 2);
-  assert.equal(setRef(db, 2, 999), false, "would otherwise violate the foreign key");
-});
-
-test("a referrer cannot be attached after verification", () => {
-  const db = freshDb();
-  addUser(db, 1);
-  addUser(db, 2, { contact: true });
-  for (const c of [-101, -102, -103]) join(db, 2, c);
-  claim(db, 2);
-  assert.equal(setRef(db, 2, 1), false, "late referrer would credit someone for an already-counted user");
 });
 
 console.log("\nQualification and payment");

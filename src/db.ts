@@ -130,56 +130,6 @@ export async function setContactShared(
   return (await getUserById(db, id)) ? "phone_taken" : "no_user";
 }
 
-/**
- * Finds the account a phone number belongs to. Tries the full normalized
- * number first; falls back to the 10-digit tail so that someone who types
- * "9876543210" still matches a referrer stored as "919876543210". The tail
- * match is only honoured when it resolves to exactly one account -- an
- * ambiguous tail is reported rather than guessed, because guessing would
- * credit the wrong referrer.
- */
-export async function getUserByPhone(
-  db: D1Database,
-  normalized: string,
-  tail: string
-): Promise<UserRow | "ambiguous" | null> {
-  const exact = await db
-    .prepare("SELECT * FROM users WHERE phone_normalized = ?")
-    .bind(normalized)
-    .first<UserRow>();
-  if (exact) return exact;
-
-  const res = await db
-    .prepare("SELECT * FROM users WHERE phone_tail = ? LIMIT 2")
-    .bind(tail)
-    .all<UserRow>();
-  const rows = res.results ?? [];
-  if (rows.length === 1) return rows[0];
-  if (rows.length > 1) return "ambiguous";
-  return null;
-}
-
-/**
- * Sets a referrer exactly once. The guards live in the WHERE clause so two
- * concurrent attempts cannot both succeed: a referrer can only be set while
- * none is recorded and the user is not yet verified, never to the user
- * themselves, and only to an account that actually exists.
- */
-export async function trySetReferrer(db: D1Database, userId: number, referrerId: number): Promise<boolean> {
-  const res = await db
-    .prepare(
-      `UPDATE users SET referred_by = ?
-       WHERE telegram_user_id = ?
-         AND referred_by IS NULL
-         AND verified = 0
-         AND telegram_user_id <> ?
-         AND EXISTS (SELECT 1 FROM users r WHERE r.telegram_user_id = ?)`
-    )
-    .bind(referrerId, userId, referrerId, referrerId)
-    .run();
-  return (res.meta.changes ?? 0) > 0;
-}
-
 // ---- Required chats (admin-managed, unlimited, rotatable) ----
 
 export async function listRequiredChats(db: D1Database, activeOnly = true): Promise<RequiredChatRow[]> {

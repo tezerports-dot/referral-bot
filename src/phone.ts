@@ -13,9 +13,12 @@ export function normalizePhone(raw: string | null | undefined): string | null {
 }
 
 /**
- * The national part, used as a fallback when someone types "9876543210" but
- * their referrer registered as "+919876543210". Matching on this is only ever
- * accepted when it resolves to exactly one account -- see getUserByPhone.
+ * The national part of a number.
+ *
+ * Nothing reads this today: referrers are set by referral link only, so there
+ * is no lookup-by-phone path. The column is still populated so it never goes
+ * stale, and dropping it would mean a destructive migration on a live database
+ * for no gain. It is here if a phone lookup is ever wanted again.
  */
 export function phoneTail(normalized: string | null): string | null {
   if (!normalized) return null;

@@ -15,7 +15,6 @@ import {
   getMissingRequiredChats,
   getRequiredChatsWithStatus,
   getUserById,
-  getUserByPhone,
   getUserByReferralCode,
   invalidateRequiredChatCache,
   isRequiredChatCached,
@@ -24,7 +23,6 @@ import {
   setContactShared,
   setJoinRequestActive,
   setRequiredChatInviteLink,
-  trySetReferrer,
   type RequiredChatRow,
   type UserRow,
 } from "./db";
@@ -171,7 +169,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     const from = ctx.from;
     if (!from || !priv(ctx)) return;
 
-    // A referral-link payload still works and skips the "who referred you" step.
+    // The only way to be credited to a referrer: their ?start=<code> link.
     const payload = ctx.match?.toString().trim();
     let referrerId: number | null = null;
     if (payload) {
@@ -199,24 +197,14 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       return;
     }
 
-    // Brand new, no referrer yet: ask who referred them first.
-    if (!fresh.referred_by) {
-      await ctx.reply(
-        "Welcome!\n\n" +
-          "Who referred you?\n\n" +
-          "Send the phone number of the person who invited you — with or without the " +
-          "country code (for example 9876543210 or +91 98765 43210).\n\n" +
-          "If nobody referred you, tap the button below — you can still join and verify.",
-        { reply_markup: new InlineKeyboard().text("⏭ Nobody referred me", "skipref") }
-      );
-      return;
-    }
-
-    const referrer = await getUserById(env.DB, fresh.referred_by);
+    // Referral is optional and link-only: arriving through someone's link sets
+    // the referrer, arriving directly leaves it unset. Either way the next step
+    // is identical, so nobody is stopped to answer a question first.
+    const referrer = fresh.referred_by ? await getUserById(env.DB, fresh.referred_by) : null;
     const { text, kb } = await stepsMessage(
       env,
       fresh,
-      `✅ Referred by ${displayName(referrer)}.\n`
+      referrer ? `✅ Referred by ${displayName(referrer)}.\n` : ""
     );
     await ctx.reply(text, { reply_markup: kb });
   });
@@ -239,40 +227,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
 
   // ---- Referrer by phone number ----
 
-  /** Resolves a typed or forwarded number to a referrer. Returns a user-facing reply. */
-  async function claimReferrer(userId: number, raw: string): Promise<string> {
-    const me = await getUserById(env.DB, userId);
-    if (!me) return "Send /start first.";
-    if (me.referred_by) return "Your referrer is already recorded and cannot be changed.";
-
-    const normalized = normalizePhone(raw);
-    const tail = phoneTail(normalized);
-    if (!normalized || !tail) {
-      return "That does not look like a phone number. Send it with or without the country code, e.g. 9876543210.";
-    }
-    if (me.phone_normalized && me.phone_normalized === normalized) {
-      return "That is your own number. Send the number of the person who referred you, or tap “Nobody referred me”.";
-    }
-
-    const found = await getUserByPhone(env.DB, normalized, tail);
-    if (found === "ambiguous") {
-      return "More than one account matches that number. Send it with the full country code, e.g. +919876543210.";
-    }
-    if (!found) {
-      return (
-        "No account is registered with that number yet.\n\n" +
-        "Ask the person who referred you to open this bot and share their contact first, then send their number again. " +
-        "Or tap “Nobody referred me” to continue without a referrer."
-      );
-    }
-    if (found.telegram_user_id === userId) return "You cannot refer yourself.";
-
-    const ok = await trySetReferrer(env.DB, userId, found.telegram_user_id);
-    if (!ok) return "Could not record that referrer. If you are already verified, the referrer can no longer be changed.";
-    return `✅ Referred by ${displayName(found)}.\n`;
-  }
-
-  /** Sends the full steps message to a user who has just settled their referrer. */
+  /** Sends the full steps message to a user. */
   async function sendSteps(ctx: { reply: (t: string, o?: object) => Promise<unknown> }, userId: number, prefix: string) {
     const user = await getUserById(env.DB, userId);
     if (!user) return;
@@ -290,18 +245,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       await ctx.reply("Send /start first.");
       return;
     }
-    if (user.referred_by || user.verified) {
-      await ctx.reply(await progressText(env, from.id, user));
-      return;
-    }
-
-    const result = await claimReferrer(from.id, text);
-    if (result.startsWith("✅")) {
-      await tryVerifyAndQualify(env, bot.api, from.id);
-      await sendSteps(ctx, from.id, result);
-    } else {
-      await ctx.reply(result);
-    }
+    await ctx.reply(await progressText(env, from.id, user));
   });
 
   // ---- Contact sharing ----
@@ -311,25 +255,13 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     const contact = ctx.message.contact;
     if (!from || !contact || !priv(ctx)) return;
 
-    const user = await getUserById(env.DB, from.id);
-    if (!user) {
-      await ctx.reply("Send /start first.");
-      return;
-    }
-
-    // A card for somebody else, while no referrer is set, nominates a referrer.
+    // No pre-read of the user here: setContactShared reports "no_user" for an
+    // unregistered sender, so fetching the row first would only duplicate it.
+    // The request_contact button always attaches the sender's own contact.
+    // Anything else -- a forwarded contact card -- is rejected: a referrer can
+    // only ever be set by arriving through a referral link.
     if (contact.user_id !== from.id) {
-      if (user.referred_by || user.verified) {
-        await ctx.reply("Please use the button to share your own contact.");
-        return;
-      }
-      const result = await claimReferrer(from.id, contact.phone_number);
-      if (result.startsWith("✅")) {
-        await tryVerifyAndQualify(env, bot.api, from.id);
-        await sendSteps(ctx, from.id, result);
-      } else {
-        await ctx.reply(result);
-      }
+      await ctx.reply("Please use the button below to share your own contact.");
       return;
     }
 
@@ -377,11 +309,6 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     }
 
     switch (data) {
-      case "skipref": {
-        await ctx.answerCallbackQuery();
-        await sendSteps(ctx, from.id, "Continuing without a referrer.\n");
-        return;
-      }
       case "contact": {
         await ctx.answerCallbackQuery();
         if (user.contact_shared) {
