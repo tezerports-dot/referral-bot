@@ -21,7 +21,6 @@ const SQL = {
        WHERE telegram_user_id = ?
          AND verified = 0
          AND contact_shared = 1
-         AND referred_by IS NOT NULL
          AND EXISTS (SELECT 1 FROM required_chats WHERE active = 1)
          AND NOT EXISTS (
                SELECT 1 FROM required_chats rc
@@ -33,12 +32,18 @@ const SQL = {
              )`,
   claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now')
        WHERE telegram_user_id = ? AND qualified = 0 AND verified_referral_count >= ?`,
-  setContactShared: `UPDATE users SET contact_shared = 1, phone_number = ?
+  setContactShared: `UPDATE users SET contact_shared = 1, phone_number = ?, phone_normalized = ?, phone_tail = ?
        WHERE telegram_user_id = ?
          AND NOT EXISTS (
                SELECT 1 FROM users other
-               WHERE other.phone_number = ? AND other.telegram_user_id <> ?
+               WHERE other.phone_normalized = ? AND other.telegram_user_id <> ?
              )`,
+  setReferrer: `UPDATE users SET referred_by = ?
+       WHERE telegram_user_id = ?
+         AND referred_by IS NULL
+         AND verified = 0
+         AND telegram_user_id <> ?
+         AND EXISTS (SELECT 1 FROM users r WHERE r.telegram_user_id = ?)`,
   markPremiumPaid: `UPDATE users SET premium_paid = 1, premium_paid_at = datetime('now'), premium_charge_id = ?
        WHERE telegram_user_id = ? AND premium_paid = 0`,
 };
@@ -72,10 +77,14 @@ function freshDb({ chats = [-101, -102, -103] } = {}) {
 }
 
 let codeSeq = 0;
+const digits = (p) => (p === null ? null : String(p).replace(/\D/g, ""));
+const tailOf = (p) => (p === null ? null : digits(p).slice(-10));
 function addUser(db, id, { referredBy = null, contact = false, phone = null } = {}) {
   db.prepare(
-    "INSERT INTO users (telegram_user_id, referral_code, referred_by, contact_shared, phone_number) VALUES (?, ?, ?, ?, ?)"
-  ).run(id, `code${codeSeq++}`, referredBy, contact ? 1 : 0, phone);
+    `INSERT INTO users (telegram_user_id, referral_code, referred_by, contact_shared,
+                        phone_number, phone_normalized, phone_tail)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).run(id, `code${codeSeq++}`, referredBy, contact ? 1 : 0, phone, digits(phone), tailOf(phone));
 }
 function join(db, userId, chatId) {
   db.prepare("INSERT OR IGNORE INTO join_requests (telegram_user_id, chat_id) VALUES (?, ?)").run(userId, chatId);
@@ -113,11 +122,12 @@ test("does not verify without a shared contact", () => {
   assert.equal(claim(db, 2), false);
 });
 
-test("does not verify without a referrer", () => {
+test("verifies WITHOUT a referrer (referral is optional)", () => {
   const db = freshDb();
   addUser(db, 2, { referredBy: null, contact: true });
   for (const c of [-101, -102, -103]) join(db, 2, c);
-  assert.equal(claim(db, 2), false);
+  assert.equal(claim(db, 2), true, "an organic user must be able to verify on their own");
+  assert.equal(isVerified(db, 2), true);
 });
 
 test("a newly added chat blocks users who have not joined it", () => {
@@ -203,7 +213,7 @@ test("duplicate join requests are idempotent", () => {
 console.log("\nPhone-number uniqueness (anti-sybil)");
 
 const shareContact = (db, id, phone) =>
-  db.prepare(SQL.setContactShared).run(phone, id, phone, id).changes > 0;
+  db.prepare(SQL.setContactShared).run(phone, digits(phone), tailOf(phone), id, digits(phone), id).changes > 0;
 
 test("first account can claim a phone number", () => {
   const db = freshDb();
@@ -234,6 +244,56 @@ test("the unique index blocks a duplicate phone written directly", () => {
   const db = freshDb();
   addUser(db, 1, { phone: "+911234567890" });
   assert.throws(() => addUser(db, 2, { phone: "+911234567890" }), /UNIQUE/i);
+});
+
+test("the same number written two different ways still collides", () => {
+  const db = freshDb();
+  addUser(db, 1, { phone: "+91 12345 67890" });
+  // Different raw spelling, same digits -- the old raw-column index missed this.
+  assert.throws(() => addUser(db, 2, { phone: "911234567890" }), /UNIQUE/i);
+});
+
+console.log("\nReferrer assignment");
+
+const setRef = (db, uid, rid) => db.prepare(SQL.setReferrer).run(rid, uid, rid, rid).changes > 0;
+
+test("a referrer can be set once", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2);
+  assert.equal(setRef(db, 2, 1), true);
+  assert.equal(db.prepare("SELECT referred_by r FROM users WHERE telegram_user_id = 2").get().r, 1);
+});
+
+test("a referrer cannot be changed once set", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2);
+  addUser(db, 3);
+  assert.equal(setRef(db, 3, 1), true);
+  assert.equal(setRef(db, 3, 2), false, "changing referrer would move credit after the fact");
+  assert.equal(db.prepare("SELECT referred_by r FROM users WHERE telegram_user_id = 3").get().r, 1);
+});
+
+test("nobody can refer themselves", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  assert.equal(setRef(db, 1, 1), false);
+});
+
+test("an unknown referrer is rejected", () => {
+  const db = freshDb();
+  addUser(db, 2);
+  assert.equal(setRef(db, 2, 999), false, "would otherwise violate the foreign key");
+});
+
+test("a referrer cannot be attached after verification", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2, { contact: true });
+  for (const c of [-101, -102, -103]) join(db, 2, c);
+  claim(db, 2);
+  assert.equal(setRef(db, 2, 1), false, "late referrer would credit someone for an already-counted user");
 });
 
 console.log("\nQualification and payment");

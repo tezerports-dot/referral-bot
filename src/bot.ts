@@ -1,7 +1,8 @@
-import { Bot } from "grammy";
+import { Bot, InlineKeyboard } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import type { Env } from "./types";
 import { premiumPriceStars, qualifyThreshold } from "./types";
+import { normalizePhone, phoneTail } from "./phone";
 import {
   addRequiredChat,
   countPaidUsers,
@@ -13,13 +14,16 @@ import {
   getDirectReferrals,
   getMissingRequiredChats,
   getUserById,
+  getUserByPhone,
   getUserByReferralCode,
   isRequiredChat,
   listRequiredChats,
   recordJoinRequest,
   setContactShared,
   setRequiredChatInviteLink,
+  trySetReferrer,
   type RequiredChatRow,
+  type UserRow,
 } from "./db";
 import { tryVerifyAndQualify } from "./verification";
 import { isAdmin } from "./admin";
@@ -32,68 +36,115 @@ import {
 } from "./payments";
 
 /**
- * Every reply in this bot is sent as plain text with no parse_mode. Chat
- * titles, first names and usernames all flow into these strings and are
- * attacker-controlled, so leaving Markdown/HTML parsing off removes the whole
- * class of injection-into-our-own-messages problems.
+ * Every reply is plain text with no parse_mode. Chat titles, first names and
+ * usernames all flow into these strings and are attacker-controlled, so
+ * leaving Markdown/HTML parsing off removes that whole injection class.
  */
 
-function chatLabel(chat: RequiredChatRow): string {
-  const name = chat.title?.trim() || `Chat ${chat.chat_id}`;
-  return chat.invite_link ? `${name}\n   ${chat.invite_link}` : `${name} (ask an admin for the link)`;
+/** Built fresh per call: grammY's reply_markup type expects a mutable array. */
+function contactKeyboard() {
+  return {
+    keyboard: [[{ text: "📱 Share my contact", request_contact: true }]],
+    resize_keyboard: true,
+    one_time_keyboard: true,
+  };
 }
 
-/** Human-readable "what's left to do" for a user, built from live DB state. */
+function displayName(u: UserRow | null): string {
+  if (!u) return "that account";
+  return u.first_name?.trim() || (u.username ? "@" + u.username : `user ${u.telegram_user_id}`);
+}
+
+/** Join buttons for every active chat, plus contact and verify actions. */
+function stepsKeyboard(chats: RequiredChatRow[], needsContact: boolean): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (needsContact) kb.text("📱 Share my contact", "contact").row();
+  for (const c of chats) {
+    if (c.invite_link) kb.url(`➕ Join ${c.title?.trim() || "chat"}`, c.invite_link).row();
+  }
+  kb.text("✅ Verify me", "verify");
+  return kb;
+}
+
+function menuKeyboard(user: UserRow): InlineKeyboard {
+  const kb = new InlineKeyboard()
+    .text("📊 My referrals", "menu:referrals")
+    .row()
+    .text("📋 My status", "menu:status")
+    .row()
+    .text("🔗 My referral link", "menu:link")
+    .row();
+  if (user.qualified && !user.premium_paid) kb.text("⭐ Get premium access", "menu:premium").row();
+  if (user.premium_paid) kb.text("⭐ My premium link", "menu:premium").row();
+  return kb;
+}
+
+/** The single "here is everything you need to do" message. */
+async function stepsMessage(env: Env, user: UserRow, prefix = ""): Promise<{ text: string; kb: InlineKeyboard }> {
+  const chats = await listRequiredChats(env.DB, true);
+  const missing = await getMissingRequiredChats(env.DB, user.telegram_user_id);
+  const needsContact = !user.contact_shared;
+
+  const lines = [
+    prefix,
+    "Here is everything you need to do:",
+    "",
+    `1️⃣ Share your contact  ${needsContact ? "⬜ pending" : "✅ done"}`,
+    `2️⃣ Send a join request to all ${chats.length} destination${chats.length === 1 ? "" : "s"}  ` +
+      `${missing.length === 0 ? "✅ done" : `⬜ ${chats.length - missing.length}/${chats.length} done`}`,
+    "3️⃣ Tap “✅ Verify me” when both are complete",
+    "",
+    "Join requests are approved automatically once you have shared your contact.",
+    "",
+    `Your referral link:\nhttps://t.me/${env.BOT_USERNAME}?start=${user.referral_code}`,
+  ];
+  return { text: lines.filter((l) => l !== null).join("\n").trim(), kb: stepsKeyboard(chats, needsContact) };
+}
+
+/** Plain-text summary of where a user stands. */
 async function progressText(env: Env, userId: number): Promise<string> {
   const user = await getUserById(env.DB, userId);
   if (!user) return "Send /start first.";
 
+  const threshold = qualifyThreshold(env);
   if (user.verified) {
-    const threshold = qualifyThreshold(env);
     const remaining = Math.max(0, threshold - user.verified_referral_count);
     return (
       "✅ You are verified.\n\n" +
       `Verified referrals: ${user.verified_referral_count} / ${threshold}\n` +
       (user.qualified
         ? user.premium_paid
-          ? "Premium: paid — your invite link has been sent. Use /premium to get it again."
-          : `Premium: unlocked — send /premium to pay ${premiumPriceStars(env)} Stars and get your link.`
-        : `${remaining} more to unlock the Premium Opportunity.`)
+          ? "Premium: paid — your invite link has been sent."
+          : `Premium: unlocked — ${premiumPriceStars(env)} ⭐ to get your link.`
+        : `${remaining} more verified referral${remaining === 1 ? "" : "s"} to unlock premium.`)
     );
   }
 
   const steps: string[] = [];
-  if (!user.referred_by) {
-    steps.push(
-      "• Join through a referral link. This bot only verifies users who arrive " +
-        "via someone's personal link — ask the person who invited you for theirs."
-    );
-  }
-  if (!user.contact_shared) steps.push("• Share your contact using the button on /start.");
-
+  if (!user.contact_shared) steps.push("• Share your contact.");
   const missing = await getMissingRequiredChats(env.DB, userId);
-  for (const chat of missing) steps.push(`• Send a join request to: ${chatLabel(chat)}`);
+  for (const c of missing) steps.push(`• Send a join request to ${c.title?.trim() || `chat ${c.chat_id}`}.`);
 
-  if (steps.length === 0) {
-    return "Everything looks complete — verification should land within a moment. Try /status again.";
-  }
-  return "Verification not complete yet. Remaining:\n\n" + steps.join("\n");
+  if (steps.length === 0) return "Everything looks complete — tap “✅ Verify me” again in a moment.";
+  return "Not verified yet. Remaining:\n\n" + steps.join("\n");
 }
 
 export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
   const bot = new Bot(env.BOT_TOKEN, botInfo ? { botInfo } : undefined);
+  const priv = (ctx: { chat?: { type: string } }) => ctx.chat?.type === "private";
 
-  // ---- User flow ----
+  // ---- /start ----
 
   bot.command("start", async (ctx) => {
     const from = ctx.from;
-    if (!from || ctx.chat?.type !== "private") return;
+    if (!from || !priv(ctx)) return;
 
+    // A referral-link payload still works and skips the "who referred you" step.
     const payload = ctx.match?.toString().trim();
     let referrerId: number | null = null;
     if (payload) {
       const referrer = await getUserByReferralCode(env.DB, payload);
-      if (referrer) referrerId = referrer.telegram_user_id;
+      if (referrer && referrer.telegram_user_id !== from.id) referrerId = referrer.telegram_user_id;
     }
 
     const user = await createUserIfNotExists(
@@ -103,95 +154,308 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       from.username ?? null,
       from.first_name ?? null
     );
-
-    // Join requests are stored independently of registration, so anyone who
-    // requested to join before pressing /start is already counted here.
     await tryVerifyAndQualify(env, bot.api, from.id);
 
-    const required = await listRequiredChats(env.DB, true);
-    const chatList = required.length
-      ? required.map((c, i) => `${i + 1}. ${chatLabel(c)}`).join("\n")
-      : "(no destinations configured yet — an admin needs to add them)";
+    const fresh = (await getUserById(env.DB, from.id)) ?? user;
 
-    await ctx.reply(
-      "Welcome! To complete verification:\n\n" +
-        "1. Share your contact using the button below.\n" +
-        "2. Send a join request to each of these:\n\n" +
-        chatList +
-        "\n\nYour personal referral link:\n" +
-        `https://t.me/${env.BOT_USERNAME}?start=${user.referral_code}\n\n` +
-        "Check your progress any time with /status.",
-      {
-        reply_markup: {
-          keyboard: [[{ text: "📱 Share my contact", request_contact: true }]],
-          resize_keyboard: true,
-          one_time_keyboard: true,
-        },
-      }
+    // Returning user who is already through the funnel gets the menu.
+    if (fresh.verified) {
+      await ctx.reply(
+        `Welcome back, ${displayName(fresh)}.\n\nWhat would you like to see?`,
+        { reply_markup: menuKeyboard(fresh) }
+      );
+      return;
+    }
+
+    // Brand new, no referrer yet: ask who referred them first.
+    if (!fresh.referred_by) {
+      await ctx.reply(
+        "Welcome!\n\n" +
+          "Who referred you?\n\n" +
+          "Send the phone number of the person who invited you — with or without the " +
+          "country code (for example 9876543210 or +91 98765 43210).\n\n" +
+          "If nobody referred you, tap the button below — you can still join and verify.",
+        { reply_markup: new InlineKeyboard().text("⏭ Nobody referred me", "skipref") }
+      );
+      return;
+    }
+
+    const referrer = await getUserById(env.DB, fresh.referred_by);
+    const { text, kb } = await stepsMessage(
+      env,
+      fresh,
+      `✅ Referred by ${displayName(referrer)}.\n`
     );
+    await ctx.reply(text, { reply_markup: kb });
   });
 
   bot.command("status", async (ctx) => {
-    if (!ctx.from || ctx.chat?.type !== "private") return;
+    if (!ctx.from || !priv(ctx)) return;
     await ctx.reply(await progressText(env, ctx.from.id));
   });
 
-  bot.command("premium", async (ctx) => {
+  bot.command("menu", async (ctx) => {
     const from = ctx.from;
-    if (!from || ctx.chat?.type !== "private") return;
+    if (!from || !priv(ctx)) return;
+    const user = await getUserById(env.DB, from.id);
+    if (!user) {
+      await ctx.reply("Send /start first.");
+      return;
+    }
+    await ctx.reply("Your account:", { reply_markup: menuKeyboard(user) });
+  });
+
+  // ---- Referrer by phone number ----
+
+  /** Resolves a typed or forwarded number to a referrer. Returns a user-facing reply. */
+  async function claimReferrer(userId: number, raw: string): Promise<string> {
+    const me = await getUserById(env.DB, userId);
+    if (!me) return "Send /start first.";
+    if (me.referred_by) return "Your referrer is already recorded and cannot be changed.";
+
+    const normalized = normalizePhone(raw);
+    const tail = phoneTail(normalized);
+    if (!normalized || !tail) {
+      return "That does not look like a phone number. Send it with or without the country code, e.g. 9876543210.";
+    }
+    if (me.phone_normalized && me.phone_normalized === normalized) {
+      return "That is your own number. Send the number of the person who referred you, or tap “Nobody referred me”.";
+    }
+
+    const found = await getUserByPhone(env.DB, normalized, tail);
+    if (found === "ambiguous") {
+      return "More than one account matches that number. Send it with the full country code, e.g. +919876543210.";
+    }
+    if (!found) {
+      return (
+        "No account is registered with that number yet.\n\n" +
+        "Ask the person who referred you to open this bot and share their contact first, then send their number again. " +
+        "Or tap “Nobody referred me” to continue without a referrer."
+      );
+    }
+    if (found.telegram_user_id === userId) return "You cannot refer yourself.";
+
+    const ok = await trySetReferrer(env.DB, userId, found.telegram_user_id);
+    if (!ok) return "Could not record that referrer. If you are already verified, the referrer can no longer be changed.";
+    return `✅ Referred by ${displayName(found)}.\n`;
+  }
+
+  /** Sends the full steps message to a user who has just settled their referrer. */
+  async function sendSteps(ctx: { reply: (t: string, o?: object) => Promise<unknown> }, userId: number, prefix: string) {
+    const user = await getUserById(env.DB, userId);
+    if (!user) return;
+    const { text, kb } = await stepsMessage(env, user, prefix);
+    await ctx.reply(text, { reply_markup: kb });
+  }
+
+  bot.on("message:text", async (ctx) => {
+    const from = ctx.from;
+    const text = ctx.message.text.trim();
+    if (!from || !priv(ctx) || text.startsWith("/")) return;
 
     const user = await getUserById(env.DB, from.id);
     if (!user) {
       await ctx.reply("Send /start first.");
       return;
     }
-    if (!user.qualified) {
+    if (user.referred_by || user.verified) {
       await ctx.reply(await progressText(env, from.id));
       return;
     }
-    if (user.premium_paid) {
-      const link = await issuePremiumInviteLink(env, bot.api, from.id);
-      if (!link) await ctx.reply("Your payment is recorded but the link isn't ready yet. An admin has been notified.");
-      return;
+
+    const result = await claimReferrer(from.id, text);
+    if (result.startsWith("✅")) {
+      await tryVerifyAndQualify(env, bot.api, from.id);
+      await sendSteps(ctx, from.id, result);
+    } else {
+      await ctx.reply(result);
     }
-    await sendPremiumInvoice(env, bot.api, from.id);
   });
+
+  // ---- Contact sharing ----
 
   bot.on("message:contact", async (ctx) => {
     const from = ctx.from;
     const contact = ctx.message.contact;
-    if (!from || !contact) return;
+    if (!from || !contact || !priv(ctx)) return;
 
-    // The request_contact button always attaches the sender's own contact.
-    // Reject anything else (e.g. a manually forwarded contact card).
-    if (contact.user_id !== from.id) {
-      await ctx.reply("Please use the button to share your own contact.");
+    const user = await getUserById(env.DB, from.id);
+    if (!user) {
+      await ctx.reply("Send /start first.");
       return;
     }
 
-    const result = await setContactShared(env.DB, from.id, contact.phone_number);
+    // A card for somebody else, while no referrer is set, nominates a referrer.
+    if (contact.user_id !== from.id) {
+      if (user.referred_by || user.verified) {
+        await ctx.reply("Please use the button to share your own contact.");
+        return;
+      }
+      const result = await claimReferrer(from.id, contact.phone_number);
+      if (result.startsWith("✅")) {
+        await tryVerifyAndQualify(env, bot.api, from.id);
+        await sendSteps(ctx, from.id, result);
+      } else {
+        await ctx.reply(result);
+      }
+      return;
+    }
+
+    const normalized = normalizePhone(contact.phone_number);
+    const tail = phoneTail(normalized);
+    if (!normalized || !tail) {
+      await ctx.reply("Telegram sent a phone number we could not read. Please try again.");
+      return;
+    }
+
+    const result = await setContactShared(env.DB, from.id, contact.phone_number, normalized, tail);
     if (result === "no_user") {
       await ctx.reply("Send /start first.");
       return;
     }
     if (result === "phone_taken") {
       await ctx.reply(
-        "That phone number is already linked to another account. Each phone number can verify only one account."
+        "That phone number is already linked to another account. Each number can verify only one account."
       );
       return;
     }
 
     await tryVerifyAndQualify(env, bot.api, from.id);
-    await ctx.reply("Thanks! Contact received.\n\n" + (await progressText(env, from.id)));
+    const fresh = await getUserById(env.DB, from.id);
+    if (fresh?.verified) {
+      await ctx.reply("✅ Contact received — you are now fully verified!", { reply_markup: { remove_keyboard: true } });
+      await ctx.reply("Your account:", { reply_markup: menuKeyboard(fresh) });
+      return;
+    }
+    await ctx.reply("✅ Contact received.", { reply_markup: { remove_keyboard: true } });
+    await sendSteps(ctx, from.id, "");
   });
+
+  // ---- Inline button actions ----
+
+  bot.on("callback_query:data", async (ctx) => {
+    const from = ctx.from;
+    const data = ctx.callbackQuery.data;
+    if (!from) return;
+
+    const user = await getUserById(env.DB, from.id);
+    if (!user) {
+      await ctx.answerCallbackQuery({ text: "Send /start first.", show_alert: true });
+      return;
+    }
+
+    switch (data) {
+      case "skipref": {
+        await ctx.answerCallbackQuery();
+        await sendSteps(ctx, from.id, "Continuing without a referrer.\n");
+        return;
+      }
+      case "contact": {
+        await ctx.answerCallbackQuery();
+        if (user.contact_shared) {
+          await ctx.reply("You have already shared your contact.");
+          return;
+        }
+        await ctx.reply("Tap the button below to share your contact.", { reply_markup: contactKeyboard() });
+        return;
+      }
+      case "verify": {
+        await tryVerifyAndQualify(env, bot.api, from.id);
+        const fresh = await getUserById(env.DB, from.id);
+        if (fresh?.verified) {
+          await ctx.answerCallbackQuery({ text: "✅ Verified!", show_alert: false });
+          await ctx.reply("✅ You are verified!", { reply_markup: menuKeyboard(fresh) });
+        } else {
+          await ctx.answerCallbackQuery({ text: "Not complete yet — see below.", show_alert: false });
+          await ctx.reply(await progressText(env, from.id));
+        }
+        return;
+      }
+      case "menu:referrals": {
+        await ctx.answerCallbackQuery();
+        const threshold = qualifyThreshold(env);
+        const remaining = Math.max(0, threshold - user.verified_referral_count);
+        await ctx.reply(
+          "📊 Your referrals\n\n" +
+            `Verified referrals: ${user.verified_referral_count}\n` +
+            `Needed for premium: ${threshold}\n` +
+            (user.qualified ? "Status: unlocked ⭐" : `Still needed: ${remaining}`)
+        );
+        return;
+      }
+      case "menu:status": {
+        await ctx.answerCallbackQuery();
+        await ctx.reply(
+          "📋 Your account\n\n" +
+            `Verified: ${user.verified ? "yes" : "no"}\n` +
+            `Contact shared: ${user.contact_shared ? "yes" : "no"}\n` +
+            `Referred by: ${user.referred_by ? displayName(await getUserById(env.DB, user.referred_by)) : "nobody"}\n` +
+            `Verified referrals: ${user.verified_referral_count}\n` +
+            `Premium: ${user.premium_paid ? "paid" : user.qualified ? "unlocked, not paid" : "locked"}\n` +
+            `Joined: ${user.created_at}`
+        );
+        return;
+      }
+      case "menu:link": {
+        await ctx.answerCallbackQuery();
+        await ctx.reply(
+          "🔗 Your referral link — share this, or give people your phone number:\n\n" +
+            `https://t.me/${env.BOT_USERNAME}?start=${user.referral_code}`
+        );
+        return;
+      }
+      case "menu:premium": {
+        await ctx.answerCallbackQuery();
+        if (user.premium_paid) {
+          const link = await issuePremiumInviteLink(env, bot.api, from.id);
+          if (!link) await ctx.reply("Your payment is recorded but the link is not ready. An admin has been notified.");
+          return;
+        }
+        if (!user.qualified) {
+          await ctx.reply(await progressText(env, from.id));
+          return;
+        }
+        await sendPremiumInvoice(env, bot.api, from.id);
+        return;
+      }
+      default:
+        await ctx.answerCallbackQuery();
+        return;
+    }
+  });
+
+  // ---- Join requests: only people who came through the bot get in ----
 
   bot.on("chat_join_request", async (ctx) => {
     const req = ctx.chatJoinRequest;
-    // Checked against the live required set, so rotating the list takes effect
-    // immediately without a redeploy.
     if (!(await isRequiredChat(env.DB, req.chat.id))) return;
 
+    const user = await getUserById(env.DB, req.from.id);
+
+    // Anyone who did not onboard through the bot is turned away, which is what
+    // makes the bot the only route into these chats even if a link leaks.
+    if (!user || !user.contact_shared) {
+      try {
+        await bot.api.declineChatJoinRequest(req.chat.id, req.from.id);
+      } catch (err) {
+        console.error(`Failed to decline join request from ${req.from.id}:`, err);
+      }
+      await bot.api
+        .sendMessage(
+          req.from.id,
+          `To join, start @${env.BOT_USERNAME} first and share your contact. ` +
+            "Your request was not approved because it did not come through the bot."
+        )
+        .catch(() => {});
+      return;
+    }
+
     await recordJoinRequest(env.DB, req.from.id, req.chat.id);
+    try {
+      await bot.api.approveChatJoinRequest(req.chat.id, req.from.id);
+    } catch (err) {
+      console.error(`Failed to approve join request from ${req.from.id}:`, err);
+    }
     await tryVerifyAndQualify(env, bot.api, req.from.id);
   });
 
@@ -205,9 +469,8 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     await handleSuccessfulPayment(env, bot.api, ctx);
   });
 
-  // ---- Admin: chat list management ----
+  // ---- Admin: required chat list ----
 
-  /** Mints the approval-required invite link the bot shows to users. */
   async function mintJoinRequestLink(chatId: number): Promise<string | null> {
     try {
       const invite = await bot.api.createChatInviteLink(chatId, {
@@ -223,23 +486,18 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
 
   bot.command("addchat", async (ctx) => {
     if (!isAdmin(env, ctx.from?.id)) return;
-
     const arg = ctx.match?.toString().trim();
     const inTargetChat = ctx.chat && ctx.chat.type !== "private";
     const chatId = arg ? Number(arg) : inTargetChat ? ctx.chat!.id : NaN;
 
     if (!Number.isInteger(chatId)) {
       await ctx.reply(
-        "Usage:\n" +
-          "• /addchat <chat_id> — from this DM\n" +
-          "• /addchat — sent inside the group you want to add\n\n" +
+        "Usage:\n• /addchat <chat_id> — from this DM\n• /addchat — sent inside the group you want to add\n\n" +
           "The bot must already be an admin there with 'Invite Users via Link'."
       );
       return;
     }
 
-    // Pull the real title/type from Telegram; also proves the bot can see the
-    // chat at all before we start requiring users to join it.
     let title: string | null = null;
     let kind = "group";
     try {
@@ -247,30 +505,25 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       title = "title" in chat ? chat.title ?? null : null;
       kind = chat.type === "channel" ? "channel" : "group";
     } catch (err) {
-      await ctx.reply(
-        `Could not read chat ${chatId}. Add the bot as an administrator there first, then try again.\n\n${err}`
-      );
+      await ctx.reply(`Could not read chat ${chatId}. Add the bot as an administrator there first.\n\n${err}`);
       return;
     }
 
     await addRequiredChat(env.DB, chatId, title, kind, ctx.from!.id);
-
     const link = await mintJoinRequestLink(chatId);
     if (link) await setRequiredChatInviteLink(env.DB, chatId, link);
 
     await ctx.reply(
-      `✅ Added ${title ?? chatId} (${kind}) to the required list.\n\n` +
+      `✅ Added ${title ?? chatId} (${kind}).\n\n` +
         (link
-          ? `Approval-required invite link (shown to users):\n${link}`
-          : "⚠️ Could not create an invite link — give the bot 'Invite Users via Link' admin rights and re-run /addchat. " +
-            "Users will not see a link for this chat until then.")
+          ? `Approval-required link:\n${link}`
+          : "⚠️ Could not create an invite link — give the bot 'Invite Users via Link' and re-run /addchat.")
     );
   });
 
   bot.command("removechat", async (ctx) => {
     if (!isAdmin(env, ctx.from?.id)) return;
-    const arg = ctx.match?.toString().trim();
-    const chatId = arg ? Number(arg) : NaN;
+    const chatId = Number(ctx.match?.toString().trim());
     if (!Number.isInteger(chatId)) {
       await ctx.reply("Usage: /removechat <chat_id>  (see /chats)");
       return;
@@ -278,7 +531,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     const removed = await deactivateRequiredChat(env.DB, chatId);
     await ctx.reply(
       removed
-        ? `✅ Removed ${chatId} from the required list.\n\nAlready-verified users keep their status. New users are no longer asked for it.`
+        ? `✅ Removed ${chatId}. Already-verified users keep their status.`
         : `${chatId} was not in the active required list.`
     );
   });
@@ -287,18 +540,18 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     if (!isAdmin(env, ctx.from?.id)) return;
     const chats = await listRequiredChats(env.DB, false);
     if (chats.length === 0) {
-      await ctx.reply("No required chats configured. Add one with /addchat <chat_id>.");
+      await ctx.reply("No required chats. Add one with /addchat <chat_id>.");
       return;
     }
-    const lines = chats.map(
-      (c) =>
-        `${c.active ? "🟢" : "⚪"} ${c.chat_id} — ${c.title ?? "(untitled)"} [${c.kind}]` +
-        (c.invite_link ? `\n   ${c.invite_link}` : "\n   (no invite link)")
-    );
     await ctx.reply(
       `Required chats (${chats.filter((c) => c.active).length} active):\n\n` +
-        lines.join("\n") +
-        "\n\n🟢 = required now, ⚪ = removed (kept for history)"
+        chats
+          .map(
+            (c) =>
+              `${c.active ? "🟢" : "⚪"} ${c.chat_id} — ${c.title ?? "(untitled)"} [${c.kind}]` +
+              (c.invite_link ? `\n   ${c.invite_link}` : "\n   (no invite link)")
+          )
+          .join("\n")
     );
   });
 
@@ -315,20 +568,16 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     ]);
     await ctx.reply(
       "📊 Stats\n" +
-        `Total registered: ${total}\n` +
-        `Verified: ${verified}\n` +
-        `Qualified (${qualifyThreshold(env)}+): ${qualified}\n` +
-        `Premium paid: ${paid}\n` +
-        `Required chats: ${chats.length}\n` +
-        `Premium price: ${premiumPriceStars(env)} ⭐`
+        `Total registered: ${total}\nVerified: ${verified}\n` +
+        `Qualified (${qualifyThreshold(env)}+): ${qualified}\nPremium paid: ${paid}\n` +
+        `Required chats: ${chats.length}\nPremium price: ${premiumPriceStars(env)} ⭐`
     );
   });
 
   bot.command("referrals", async (ctx) => {
     if (!isAdmin(env, ctx.from?.id)) return;
-    const arg = ctx.match?.toString().trim();
-    const targetId = Number(arg);
-    if (!arg || !Number.isInteger(targetId)) {
+    const targetId = Number(ctx.match?.toString().trim());
+    if (!Number.isInteger(targetId)) {
       await ctx.reply("Usage: /referrals <telegram_user_id>");
       return;
     }
@@ -338,13 +587,10 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       return;
     }
     const referrals = await getDirectReferrals(env.DB, targetId, 100);
-    const verifiedAmongThem = referrals.filter((r) => r.verified).length;
     await ctx.reply(
-      `User ${targetId}\n` +
-        `Verified referral count: ${user.verified_referral_count}\n` +
-        `Qualified: ${user.qualified ? "yes" : "no"}\n` +
-        `Premium paid: ${user.premium_paid ? "yes" : "no"}\n` +
-        `Direct referrals fetched: ${referrals.length} (verified among these: ${verifiedAmongThem})`
+      `User ${targetId}\nVerified referral count: ${user.verified_referral_count}\n` +
+        `Qualified: ${user.qualified ? "yes" : "no"}\nPremium paid: ${user.premium_paid ? "yes" : "no"}\n` +
+        `Direct referrals fetched: ${referrals.length} (verified among these: ${referrals.filter((r) => r.verified).length})`
     );
   });
 
@@ -356,7 +602,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       return;
     }
     const link = await issuePremiumInviteLink(env, bot.api, targetId);
-    await ctx.reply(link ? `Sent. Link: ${link}` : "Could not issue a link — check that the user has paid and that PREMIUM_GROUP_CHAT_ID is set.");
+    await ctx.reply(link ? `Sent. Link: ${link}` : "Could not issue a link — check the user has paid and PREMIUM_GROUP_CHAT_ID is set.");
   });
 
   bot.command("refund", async (ctx) => {
@@ -369,23 +615,14 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     await ctx.reply(await refundPremium(env, bot.api, targetId));
   });
 
-  // Tells admins the chat ID whenever the bot is added somewhere, so adding a
-  // new destination never requires hunting for IDs by hand.
   bot.on("my_chat_member", async (ctx) => {
-    const status = ctx.myChatMember.new_chat_member.status;
-    if (status !== "administrator") return;
+    if (ctx.myChatMember.new_chat_member.status !== "administrator") return;
     const chat = ctx.myChatMember.chat;
     if (chat.type === "private") return;
-
     const actorId = ctx.myChatMember.from.id;
     if (!isAdmin(env, actorId)) return;
-
     await bot.api
-      .sendMessage(
-        actorId,
-        `I was made an admin in "${chat.title}" (${chat.type}).\n\n` +
-          `To require it for verification:\n/addchat ${chat.id}`
-      )
+      .sendMessage(actorId, `I am now an admin in "${chat.title}" (${chat.type}).\n\nTo require it:\n/addchat ${chat.id}`)
       .catch(() => {});
   });
 

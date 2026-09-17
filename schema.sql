@@ -11,6 +11,10 @@ CREATE TABLE IF NOT EXISTS users (
   username                 TEXT,
   first_name               TEXT,
   phone_number             TEXT,
+  -- Digits-only form, so "+91 98765 43210" and "919876543210" compare equal.
+  phone_normalized         TEXT,
+  -- Last 10 digits, for matching a number typed without its country code.
+  phone_tail               TEXT,
   contact_shared           INTEGER NOT NULL DEFAULT 0,
   verified                 INTEGER NOT NULL DEFAULT 0,
   verified_at              TEXT,
@@ -28,10 +32,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_users_referral_code ON users(referral_code
 CREATE INDEX IF NOT EXISTS idx_users_referred_by ON users(referred_by);
 CREATE INDEX IF NOT EXISTS idx_users_qualified ON users(qualified);
 
--- Anti-sybil: one phone number can back at most one account. Partial index so
--- that the many users who have not shared contact yet (NULL) do not collide.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone
-  ON users(phone_number) WHERE phone_number IS NOT NULL;
+-- Anti-sybil: one phone number can back at most one account. Enforced on the
+-- normalized form so that two spellings of the same number still collide.
+-- Partial, so the many users who have not shared contact yet do not clash.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_phone_normalized
+  ON users(phone_normalized) WHERE phone_normalized IS NOT NULL;
+
+-- Non-unique: two countries can share a 10-digit tail. A lookup that matches
+-- more than one row is rejected rather than guessed.
+CREATE INDEX IF NOT EXISTS idx_users_phone_tail
+  ON users(phone_tail) WHERE phone_tail IS NOT NULL;
 
 -- The set of groups/channels a user must send a join request to in order to
 -- verify. Admin-managed at runtime (/addchat, /removechat) -- there is no

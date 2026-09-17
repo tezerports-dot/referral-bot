@@ -7,6 +7,8 @@ export interface UserRow {
   username: string | null;
   first_name: string | null;
   phone_number: string | null;
+  phone_normalized: string | null;
+  phone_tail: string | null;
   contact_shared: number;
   verified: number;
   verified_at: string | null;
@@ -98,21 +100,77 @@ export type ContactResult = "ok" | "phone_taken" | "no_user";
  * same phone number concurrently cannot both succeed. Re-sharing the same
  * number from the same account stays a successful no-op.
  */
-export async function setContactShared(db: D1Database, id: number, phone: string): Promise<ContactResult> {
+export async function setContactShared(
+  db: D1Database,
+  id: number,
+  phone: string,
+  normalized: string,
+  tail: string
+): Promise<ContactResult> {
   const res = await db
     .prepare(
-      `UPDATE users SET contact_shared = 1, phone_number = ?
+      `UPDATE users SET contact_shared = 1, phone_number = ?, phone_normalized = ?, phone_tail = ?
        WHERE telegram_user_id = ?
          AND NOT EXISTS (
                SELECT 1 FROM users other
-               WHERE other.phone_number = ? AND other.telegram_user_id <> ?
+               WHERE other.phone_normalized = ? AND other.telegram_user_id <> ?
              )`
     )
-    .bind(phone, id, phone, id)
+    .bind(phone, normalized, tail, id, normalized, id)
     .run();
 
   if ((res.meta.changes ?? 0) > 0) return "ok";
   return (await getUserById(db, id)) ? "phone_taken" : "no_user";
+}
+
+/**
+ * Finds the account a phone number belongs to. Tries the full normalized
+ * number first; falls back to the 10-digit tail so that someone who types
+ * "9876543210" still matches a referrer stored as "919876543210". The tail
+ * match is only honoured when it resolves to exactly one account -- an
+ * ambiguous tail is reported rather than guessed, because guessing would
+ * credit the wrong referrer.
+ */
+export async function getUserByPhone(
+  db: D1Database,
+  normalized: string,
+  tail: string
+): Promise<UserRow | "ambiguous" | null> {
+  const exact = await db
+    .prepare("SELECT * FROM users WHERE phone_normalized = ?")
+    .bind(normalized)
+    .first<UserRow>();
+  if (exact) return exact;
+
+  const res = await db
+    .prepare("SELECT * FROM users WHERE phone_tail = ? LIMIT 2")
+    .bind(tail)
+    .all<UserRow>();
+  const rows = res.results ?? [];
+  if (rows.length === 1) return rows[0];
+  if (rows.length > 1) return "ambiguous";
+  return null;
+}
+
+/**
+ * Sets a referrer exactly once. The guards live in the WHERE clause so two
+ * concurrent attempts cannot both succeed: a referrer can only be set while
+ * none is recorded and the user is not yet verified, never to the user
+ * themselves, and only to an account that actually exists.
+ */
+export async function trySetReferrer(db: D1Database, userId: number, referrerId: number): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `UPDATE users SET referred_by = ?
+       WHERE telegram_user_id = ?
+         AND referred_by IS NULL
+         AND verified = 0
+         AND telegram_user_id <> ?
+         AND EXISTS (SELECT 1 FROM users r WHERE r.telegram_user_id = ?)`
+    )
+    .bind(referrerId, userId, referrerId, referrerId)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
 }
 
 // ---- Required chats (admin-managed, unlimited, rotatable) ----
@@ -215,6 +273,10 @@ export async function recordJoinRequest(db: D1Database, userId: number, chatId: 
  * Atomically checks every verification condition against the *current* active
  * required-chat set and flips verified 0->1 in a single statement.
  *
+ * A referrer is NOT required: an organic user who finds the bot directly can
+ * verify on their own. Referrals only matter for reaching the premium
+ * threshold, which is counted on the referrer's side.
+ *
  * Returns true only for the call that actually performed the transition.
  * Concurrent or duplicate calls (Telegram webhook retries racing each other)
  * see 0 rows changed and return false, which is what prevents a referrer's
@@ -231,7 +293,6 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
        WHERE telegram_user_id = ?
          AND verified = 0
          AND contact_shared = 1
-         AND referred_by IS NOT NULL
          AND EXISTS (SELECT 1 FROM required_chats WHERE active = 1)
          AND NOT EXISTS (
                SELECT 1 FROM required_chats rc
