@@ -3,7 +3,7 @@
 Cloudflare Workers + D1. Users verify by sharing contact and sending join
 requests to an **admin-managed list of groups/channels** (any number, changeable
 at runtime). **200** verified direct referrals unlock the Premium Opportunity,
-which is then purchased with **200 Telegram Stars**.
+which is then purchased with **1500 Telegram Stars**.
 
 ## Upgrading from the previous version
 
@@ -111,7 +111,7 @@ Telegram's webhook retries safe.
 
 Users can check where they stand at any time with `/status`.
 
-## Premium: 200 referrals, 200 Stars
+## Premium: 200 referrals, 1500 Stars
 
 At `QUALIFY_THRESHOLD` verified referrals the referrer is marked qualified and
 sent a Telegram Stars invoice for `PREMIUM_PRICE_STARS`. On successful payment

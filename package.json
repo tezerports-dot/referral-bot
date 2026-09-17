@@ -9,11 +9,12 @@
     "typecheck": "tsc --noEmit",
     "db:init": "wrangler d1 execute referral_bot_db --file=./schema.sql",
     "db:init:remote": "wrangler d1 execute referral_bot_db --remote --file=./schema.sql",
-    "test": "node tests/sql.test.mjs && node tests/migration.test.mjs",
+    "test": "node tests/sql.test.mjs && node tests/migration.test.mjs && node tests/config.test.mjs",
     "test:sql": "node tests/sql.test.mjs",
     "test:migration": "node tests/migration.test.mjs",
     "db:migrate": "wrangler d1 execute referral_bot_db --file=./migrations/0002_dynamic_requirements.sql",
-    "db:migrate:remote": "wrangler d1 execute referral_bot_db --remote --file=./migrations/0002_dynamic_requirements.sql"
+    "db:migrate:remote": "wrangler d1 execute referral_bot_db --remote --file=./migrations/0002_dynamic_requirements.sql",
+    "test:config": "node tests/config.test.mjs"
   },
   "dependencies": {
     "grammy": "^1.30.0"

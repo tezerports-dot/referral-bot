@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      # Typecheck first: a type error explains a test failure better than the
+      # test failure does.
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      # Includes the wrangler.toml credential guard, which is the only thing
+      # standing between a pasted dashboard "sync" snippet and a bot token in
+      # git history. It needs to run on every PR, not just when someone
+      # remembers to run it locally.
+      - name: Tests
+        run: npm test
