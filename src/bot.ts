@@ -1,7 +1,7 @@
 import { Bot, InlineKeyboard } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import type { Env } from "./types";
-import { premiumPriceStars, qualifyThreshold } from "./types";
+import { premiumPriceStars, qualifyThreshold, referralRewardInr, rewardCapInr, rewardInr } from "./types";
 import { normalizePhone, phoneTail } from "./phone";
 import {
   addRequiredChat,
@@ -20,6 +20,7 @@ import {
   listRequiredChats,
   recordJoinRequest,
   setContactShared,
+  setJoinRequestActive,
   setRequiredChatInviteLink,
   trySetReferrer,
   type RequiredChatRow,
@@ -111,7 +112,8 @@ async function progressText(env: Env, userId: number): Promise<string> {
     const remaining = Math.max(0, threshold - user.verified_referral_count);
     return (
       "✅ You are verified.\n\n" +
-      `Verified referrals: ${user.verified_referral_count} / ${threshold}\n` +
+      `Counted referrals: ${user.verified_referral_count} / ${threshold}\n` +
+      `Earned: ₹${rewardInr(env, user.verified_referral_count)} of ₹${rewardCapInr(env)}\n` +
       (user.qualified
         ? user.premium_paid
           ? "Premium: paid — your invite link has been sent."
@@ -377,9 +379,14 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
         const remaining = Math.max(0, threshold - user.verified_referral_count);
         await ctx.reply(
           "📊 Your referrals\n\n" +
-            `Verified referrals: ${user.verified_referral_count}\n` +
+            `Counted referrals: ${user.verified_referral_count}\n` +
+            `Earned: ₹${rewardInr(env, user.verified_referral_count)} of ₹${rewardCapInr(env)}\n` +
+            `Rate: ₹${referralRewardInr(env)} per referral\n\n` +
             `Needed for premium: ${threshold}\n` +
-            (user.qualified ? "Status: unlocked ⭐" : `Still needed: ${remaining}`)
+            (user.qualified ? "Status: unlocked ⭐" : `Still needed: ${remaining}`) +
+            "\n\nOnly members who stay in every group and channel are counted. " +
+            `If someone leaves, they stop counting and ₹${referralRewardInr(env)} comes off. ` +
+            `₹${rewardCapInr(env)} is the maximum any account can earn.`
         );
         return;
       }
@@ -390,7 +397,8 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
             `Verified: ${user.verified ? "yes" : "no"}\n` +
             `Contact shared: ${user.contact_shared ? "yes" : "no"}\n` +
             `Referred by: ${user.referred_by ? displayName(await getUserById(env.DB, user.referred_by)) : "nobody"}\n` +
-            `Verified referrals: ${user.verified_referral_count}\n` +
+            `Counted referrals: ${user.verified_referral_count}\n` +
+            `Earned: ₹${rewardInr(env, user.verified_referral_count)} of ₹${rewardCapInr(env)}\n` +
             `Premium: ${user.premium_paid ? "paid" : user.qualified ? "unlocked, not paid" : "locked"}\n` +
             `Joined: ${user.created_at}`
         );
@@ -457,6 +465,26 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       console.error(`Failed to approve join request from ${req.from.id}:`, err);
     }
     await tryVerifyAndQualify(env, bot.api, req.from.id);
+  });
+
+  // ---- Membership changes: only people who STAY are counted ----
+
+  bot.on("chat_member", async (ctx) => {
+    const upd = ctx.chatMember;
+    if (!(await isRequiredChat(env.DB, upd.chat.id))) return;
+
+    const status = upd.new_chat_member.status;
+    const present = status === "member" || status === "administrator" || status === "creator";
+    const gone = status === "left" || status === "kicked";
+    if (!present && !gone) return; // "restricted" etc. leave the state as-is
+
+    const changed = await setJoinRequestActive(env.DB, upd.new_chat_member.user.id, upd.chat.id, present);
+    if (!changed) return;
+
+    // Re-evaluates in whichever direction the new state calls for: a departure
+    // revokes verification and takes the referrer's credit back, a rejoin
+    // restores both.
+    await tryVerifyAndQualify(env, bot.api, upd.new_chat_member.user.id);
   });
 
   // ---- Telegram Stars payments ----
@@ -588,7 +616,8 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     }
     const referrals = await getDirectReferrals(env.DB, targetId, 100);
     await ctx.reply(
-      `User ${targetId}\nVerified referral count: ${user.verified_referral_count}\n` +
+      `User ${targetId}\nCounted referrals: ${user.verified_referral_count}\n` +
+        `Earned: ₹${rewardInr(env, user.verified_referral_count)} of ₹${rewardCapInr(env)}\n` +
         `Qualified: ${user.qualified ? "yes" : "no"}\nPremium paid: ${user.premium_paid ? "yes" : "no"}\n` +
         `Direct referrals fetched: ${referrals.length} (verified among these: ${referrals.filter((r) => r.verified).length})`
     );

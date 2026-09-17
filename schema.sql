@@ -75,7 +75,14 @@ CREATE TABLE IF NOT EXISTS join_requests (
   telegram_user_id INTEGER NOT NULL,
   chat_id          INTEGER NOT NULL,
   requested_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  -- 1 while the user is in the chat, 0 once they leave or are removed. Only
+  -- live memberships satisfy a requirement, so a member who joins and then
+  -- leaves stops counting for their referrer.
+  active           INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (telegram_user_id, chat_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_join_requests_active
+  ON join_requests(telegram_user_id, active);
 
 CREATE INDEX IF NOT EXISTS idx_join_requests_chat ON join_requests(chat_id);

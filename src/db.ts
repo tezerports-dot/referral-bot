@@ -239,7 +239,7 @@ export async function getMissingRequiredChats(db: D1Database, userId: number): P
        WHERE rc.active = 1
          AND NOT EXISTS (
                SELECT 1 FROM join_requests jr
-               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id
+               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
              )
        ORDER BY rc.added_at ASC`
     )
@@ -260,8 +260,8 @@ export async function getMissingRequiredChats(db: D1Database, userId: number): P
 export async function recordJoinRequest(db: D1Database, userId: number, chatId: number): Promise<void> {
   await db
     .prepare(
-      `INSERT INTO join_requests (telegram_user_id, chat_id) VALUES (?, ?)
-       ON CONFLICT(telegram_user_id, chat_id) DO NOTHING`
+      `INSERT INTO join_requests (telegram_user_id, chat_id, active) VALUES (?, ?, 1)
+       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE SET active = 1`
     )
     .bind(userId, chatId)
     .run();
@@ -299,13 +299,66 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
                WHERE rc.active = 1
                  AND NOT EXISTS (
                        SELECT 1 FROM join_requests jr
-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
                      )
              )`
     )
     .bind(userId, userId)
     .run();
   return (res.meta.changes ?? 0) > 0;
+}
+
+/** Marks a membership live or lost. Returns true if the state actually changed. */
+export async function setJoinRequestActive(
+  db: D1Database,
+  userId: number,
+  chatId: number,
+  active: boolean
+): Promise<boolean> {
+  const res = await db
+    .prepare("UPDATE join_requests SET active = ? WHERE telegram_user_id = ? AND chat_id = ? AND active <> ?")
+    .bind(active ? 1 : 0, userId, chatId, active ? 1 : 0)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
+ * The mirror image of tryClaimVerification: drops verified 1->0 in one
+ * statement when the user no longer holds a live membership in every active
+ * required chat. Returns true only for the call that performed the
+ * transition, so exactly one caller decrements the referrer -- the same
+ * discipline that stops the increment double-counting.
+ */
+export async function tryRevokeVerification(db: D1Database, userId: number): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `UPDATE users
+       SET verified = 0, verified_at = NULL
+       WHERE telegram_user_id = ?
+         AND verified = 1
+         AND EXISTS (
+               SELECT 1 FROM required_chats rc
+               WHERE rc.active = 1
+                 AND NOT EXISTS (
+                       SELECT 1 FROM join_requests jr
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+                     )
+             )`
+    )
+    .bind(userId, userId)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/** Floored at zero, so a double-decrement can never drive a count negative. */
+export async function decrementVerifiedReferralCount(db: D1Database, referrerId: number): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE users SET verified_referral_count = MAX(0, verified_referral_count - 1)
+       WHERE telegram_user_id = ?`
+    )
+    .bind(referrerId)
+    .run();
 }
 
 export async function incrementVerifiedReferralCount(db: D1Database, referrerId: number): Promise<void> {

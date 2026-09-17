@@ -2,35 +2,60 @@ import type { Api } from "grammy";
 import type { Env } from "./types";
 import { qualifyThreshold } from "./types";
 import {
+  decrementVerifiedReferralCount,
   getUserById,
   incrementVerifiedReferralCount,
   tryClaimQualification,
   tryClaimVerification,
+  tryRevokeVerification,
 } from "./db";
 import { notifyAdmins, sendPremiumInvoice } from "./payments";
 
 /**
- * Call this after any event that could complete a user's verification (contact
- * shared, a referrer being set, or a join request to any active required
- * chat). Safe to call redundantly -- it is a no-op unless this specific call
- * is the one that completes every condition.
+ * Call this after any event that could change whether a user meets every
+ * requirement: contact shared, a referrer set, a join request approved, or a
+ * membership lost. It moves verification in whichever direction the current
+ * state calls for, and is a no-op unless this specific call is the one that
+ * flips it.
+ *
+ * Qualification is deliberately NOT revoked when a count falls back below the
+ * threshold: premium access, once paid for, stays paid for. The rupee figure
+ * is derived from the live count instead, so it falls on its own.
  */
 export async function tryVerifyAndQualify(env: Env, api: Api, userId: number): Promise<void> {
   const claimed = await tryClaimVerification(env.DB, userId);
-  if (!claimed) return;
+  if (claimed) {
+    await creditReferrer(env, api, userId, +1);
+    return;
+  }
 
+  // Not newly verified. They may instead have just stopped qualifying -- a
+  // membership they had is gone. Revoking is the exact mirror of claiming and
+  // is equally single-shot, so only one caller ever takes the credit back.
+  const revoked = await tryRevokeVerification(env.DB, userId);
+  if (revoked) await creditReferrer(env, api, userId, -1);
+}
+
+/**
+ * Moves the referrer's counted total by one in either direction. Reads the
+ * referrer from the referred user, so a user with no referrer is simply a
+ * no-op -- referrals are optional and there is nobody to credit.
+ */
+async function creditReferrer(env: Env, api: Api, userId: number, delta: 1 | -1): Promise<void> {
   const user = await getUserById(env.DB, userId);
   const referrerId = user?.referred_by;
-
-  // An organic user with no referrer is fully verified at this point; there is
-  // simply nobody to credit. Referrals only matter for the premium threshold.
   if (!referrerId) return;
+
+  if (delta === -1) {
+    await decrementVerifiedReferralCount(env.DB, referrerId);
+    return;
+  }
 
   await incrementVerifiedReferralCount(env.DB, referrerId);
 
   // Re-checked on every increment rather than on an exact threshold match, so a
   // referrer who somehow passes the threshold without this branch running (a
-  // racing increment, a manual DB correction, a raised-then-lowered threshold)
+  // racing increment, a manual correction, a count that dipped and recovered)
   // still qualifies on their next referral instead of being stranded.
   const newlyQualified = await tryClaimQualification(env.DB, referrerId, qualifyThreshold(env));
   if (newlyQualified) await announceQualification(env, api, referrerId);
