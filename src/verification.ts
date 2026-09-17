@@ -11,9 +11,9 @@ import { notifyAdmins, sendPremiumInvoice } from "./payments";
 
 /**
  * Call this after any event that could complete a user's verification (contact
- * shared, or a join request to any active required chat). Safe to call
- * redundantly -- it is a no-op unless this specific call is the one that
- * completes every condition.
+ * shared, a referrer being set, or a join request to any active required
+ * chat). Safe to call redundantly -- it is a no-op unless this specific call
+ * is the one that completes every condition.
  */
 export async function tryVerifyAndQualify(env: Env, api: Api, userId: number): Promise<void> {
   const claimed = await tryClaimVerification(env.DB, userId);
@@ -21,7 +21,10 @@ export async function tryVerifyAndQualify(env: Env, api: Api, userId: number): P
 
   const user = await getUserById(env.DB, userId);
   const referrerId = user?.referred_by;
-  if (!referrerId) return; // impossible given tryClaimVerification's WHERE clause
+
+  // An organic user with no referrer is fully verified at this point; there is
+  // simply nobody to credit. Referrals only matter for the premium threshold.
+  if (!referrerId) return;
 
   await incrementVerifiedReferralCount(env.DB, referrerId);
 
