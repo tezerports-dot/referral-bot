@@ -17,7 +17,8 @@ import {
   getUserById,
   getUserByPhone,
   getUserByReferralCode,
-  isRequiredChat,
+  invalidateRequiredChatCache,
+  isRequiredChatCached,
   listRequiredChats,
   recordJoinRequest,
   setContactShared,
@@ -469,7 +470,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
 
   bot.on("chat_join_request", async (ctx) => {
     const req = ctx.chatJoinRequest;
-    if (!(await isRequiredChat(env.DB, req.chat.id))) return;
+    if (!(await isRequiredChatCached(env.DB, req.chat.id))) return;
 
     const user = await getUserById(env.DB, req.from.id);
 
@@ -504,7 +505,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
 
   bot.on("chat_member", async (ctx) => {
     const upd = ctx.chatMember;
-    if (!(await isRequiredChat(env.DB, upd.chat.id))) return;
+    if (!(await isRequiredChatCached(env.DB, upd.chat.id))) return;
 
     const status = upd.new_chat_member.status;
     const present = status === "member" || status === "administrator" || status === "creator";
@@ -571,6 +572,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     }
 
     await addRequiredChat(env.DB, chatId, title, kind, ctx.from!.id);
+    invalidateRequiredChatCache();
     const link = await mintJoinRequestLink(chatId);
     if (link) await setRequiredChatInviteLink(env.DB, chatId, link);
 
@@ -590,6 +592,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       return;
     }
     const removed = await deactivateRequiredChat(env.DB, chatId);
+    invalidateRequiredChatCache();
     await ctx.reply(
       removed
         ? `✅ Removed ${chatId}. Already-verified users keep their status.`

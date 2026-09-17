@@ -230,6 +230,40 @@ export async function deactivateRequiredChat(db: D1Database, chatId: number): Pr
   return (res.meta.changes ?? 0) > 0;
 }
 
+/**
+ * Positive-only cache of the active required chat IDs, held per isolate.
+ *
+ * chat_member fires for every membership change in every required chat, and
+ * each one previously cost a D1 read to answer a question whose answer changes
+ * about once a month. A hit now costs nothing.
+ *
+ * Only hits are trusted. A miss still falls through to the database, so a chat
+ * added seconds ago is recognised immediately rather than being ignored until
+ * the entry expires -- the cache can never cause a join request to be dropped.
+ * A stale entry for a chat just removed is harmless: verification reads
+ * required_chats live, so a lingering row cannot make anyone verified.
+ */
+const REQUIRED_CHAT_TTL_MS = 60_000;
+let requiredChatCache: { ids: Set<number>; at: number } | null = null;
+
+export function invalidateRequiredChatCache(): void {
+  requiredChatCache = null;
+}
+
+export async function isRequiredChatCached(db: D1Database, chatId: number): Promise<boolean> {
+  const now = Date.now();
+  if (requiredChatCache && now - requiredChatCache.at <= REQUIRED_CHAT_TTL_MS) {
+    if (requiredChatCache.ids.has(chatId)) return true;
+  } else {
+    const res = await db.prepare("SELECT chat_id FROM required_chats WHERE active = 1").all<{ chat_id: number }>();
+    requiredChatCache = { ids: new Set((res.results ?? []).map((r) => r.chat_id)), at: now };
+    return requiredChatCache.ids.has(chatId);
+  }
+  // Warm cache, no hit: confirm against the database before rejecting, so a
+  // newly added chat is never ignored.
+  return isRequiredChat(db, chatId);
+}
+
 export async function isRequiredChat(db: D1Database, chatId: number): Promise<boolean> {
   const row = await db
     .prepare("SELECT 1 FROM required_chats WHERE chat_id = ? AND active = 1")
