@@ -27,9 +27,23 @@ const SQL = {
                WHERE rc.active = 1
                  AND NOT EXISTS (
                        SELECT 1 FROM join_requests jr
-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
                      )
              )`,
+  revokeVerification: `UPDATE users
+       SET verified = 0, verified_at = NULL
+       WHERE telegram_user_id = ?
+         AND verified = 1
+         AND EXISTS (
+               SELECT 1 FROM required_chats rc
+               WHERE rc.active = 1
+                 AND NOT EXISTS (
+                       SELECT 1 FROM join_requests jr
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+                     )
+             )`,
+  decrement: `UPDATE users SET verified_referral_count = MAX(0, verified_referral_count - 1)
+       WHERE telegram_user_id = ?`,
   claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now')
        WHERE telegram_user_id = ? AND qualified = 0 AND verified_referral_count >= ?`,
   setContactShared: `UPDATE users SET contact_shared = 1, phone_number = ?, phone_normalized = ?, phone_tail = ?
@@ -208,6 +222,85 @@ test("duplicate join requests are idempotent", () => {
   const n = db.prepare("SELECT COUNT(*) c FROM join_requests WHERE telegram_user_id = 2").get().c;
   assert.equal(n, 3);
   assert.equal(claim(db, 2), true);
+});
+
+console.log("\nLeaving a chat stops the referral counting");
+
+const leave = (db, userId, chatId) =>
+  db.prepare("UPDATE join_requests SET active = 0 WHERE telegram_user_id = ? AND chat_id = ?").run(userId, chatId);
+const rejoin = (db, userId, chatId) =>
+  db
+    .prepare(
+      `INSERT INTO join_requests (telegram_user_id, chat_id, active) VALUES (?, ?, 1)
+       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE SET active = 1`
+    )
+    .run(userId, chatId);
+const revoke = (db, id) => db.prepare(SQL.revokeVerification).run(id, id).changes > 0;
+const decrement = (db, id) => db.prepare(SQL.decrement).run(id);
+const countOf = (db, id) =>
+  db.prepare("SELECT verified_referral_count c FROM users WHERE telegram_user_id = ?").get(id).c;
+
+function verifiedPair(db) {
+  addUser(db, 1);
+  addUser(db, 2, { referredBy: 1, contact: true });
+  for (const c of [-101, -102, -103]) join(db, 2, c);
+  assert.equal(claim(db, 2), true);
+  db.prepare("UPDATE users SET verified_referral_count = 1 WHERE telegram_user_id = 1").run();
+  return db;
+}
+
+test("leaving one required chat revokes verification", () => {
+  const db = verifiedPair(freshDb());
+  leave(db, 2, -102);
+  assert.equal(revoke(db, 2), true);
+  assert.equal(isVerified(db, 2), false);
+});
+
+test("staying in every chat keeps verification", () => {
+  const db = verifiedPair(freshDb());
+  assert.equal(revoke(db, 2), false, "nothing is missing, so nothing to revoke");
+  assert.equal(isVerified(db, 2), true);
+});
+
+test("revocation happens exactly once, so credit is taken back once", () => {
+  const db = verifiedPair(freshDb());
+  leave(db, 2, -102);
+  assert.equal(revoke(db, 2), true);
+  decrement(db, 1);
+  assert.equal(revoke(db, 2), false, "a second revoke would double-decrement the referrer");
+  assert.equal(countOf(db, 1), 0);
+});
+
+test("rejoining restores verification and the credit", () => {
+  const db = verifiedPair(freshDb());
+  leave(db, 2, -102);
+  revoke(db, 2);
+  decrement(db, 1);
+  assert.equal(countOf(db, 1), 0);
+
+  rejoin(db, 2, -102);
+  assert.equal(claim(db, 2), true, "all memberships live again");
+  assert.equal(isVerified(db, 2), true);
+});
+
+test("a departure before verifying never counted in the first place", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2, { referredBy: 1, contact: true });
+  join(db, 2, -101);
+  join(db, 2, -102);
+  join(db, 2, -103);
+  leave(db, 2, -103);
+  assert.equal(claim(db, 2), false, "an inactive membership must not satisfy the requirement");
+});
+
+test("the count can never go negative", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  assert.equal(countOf(db, 1), 0);
+  decrement(db, 1);
+  decrement(db, 1);
+  assert.equal(countOf(db, 1), 0, "MAX(0, ...) must floor it");
 });
 
 console.log("\nPhone-number uniqueness (anti-sybil)");
