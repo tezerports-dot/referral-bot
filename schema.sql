@@ -21,6 +21,11 @@ CREATE TABLE IF NOT EXISTS users (
   verified_referral_count  INTEGER NOT NULL DEFAULT 0,
   qualified                INTEGER NOT NULL DEFAULT 0,
   qualified_at             TEXT,
+  -- Rupee figure frozen at the instant of qualification. The live figure is
+  -- derived from the current count and erodes when referrals leave; this one
+  -- is the settlement record and never moves.
+  reward_settled_inr       INTEGER,
+  reward_settled_at        TEXT,
   premium_paid             INTEGER NOT NULL DEFAULT 0,
   premium_paid_at          TEXT,
   premium_charge_id        TEXT,

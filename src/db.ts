@@ -15,6 +15,8 @@ export interface UserRow {
   verified_referral_count: number;
   qualified: number;
   qualified_at: string | null;
+  reward_settled_inr: number | null;
+  reward_settled_at: string | null;
   premium_paid: number;
   premium_paid_at: string | null;
   premium_charge_id: string | null;
@@ -370,17 +372,32 @@ export async function incrementVerifiedReferralCount(db: D1Database, referrerId:
 
 /**
  * Atomically claims qualification for a referrer who has reached the
- * threshold. Uses `>=` rather than an exact match and reads the count inside
- * the same statement that flips the flag, so a concurrent increment can never
- * cause the threshold crossing to be missed or double-counted.
+ * threshold, and freezes the rupee figure in the same statement.
+ *
+ * Uses `>=` rather than an exact match and reads the count inside the same
+ * statement that flips the flag, so a concurrent increment can never cause the
+ * threshold crossing to be missed or double-counted.
+ *
+ * The snapshot is taken here rather than by a later read because this is the
+ * instant the money is owed. Computing it in the same UPDATE means the count it
+ * is based on cannot shift between the check and the capture, and because the
+ * statement only ever fires once per user, the settled figure is written once
+ * and never moves again -- even as the live figure erodes when referrals leave.
  */
-export async function tryClaimQualification(db: D1Database, userId: number, threshold: number): Promise<boolean> {
+export async function tryClaimQualification(
+  db: D1Database,
+  userId: number,
+  threshold: number,
+  rewardPerReferral: number
+): Promise<boolean> {
   const res = await db
     .prepare(
-      `UPDATE users SET qualified = 1, qualified_at = datetime('now')
+      `UPDATE users SET qualified = 1, qualified_at = datetime('now'),
+              reward_settled_inr = MIN(verified_referral_count, ?) * ?,
+              reward_settled_at = datetime('now')
        WHERE telegram_user_id = ? AND qualified = 0 AND verified_referral_count >= ?`
     )
-    .bind(userId, threshold)
+    .bind(threshold, rewardPerReferral, userId, threshold)
     .run();
   return (res.meta.changes ?? 0) > 0;
 }

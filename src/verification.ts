@@ -1,6 +1,6 @@
 import type { Api } from "grammy";
 import type { Env } from "./types";
-import { qualifyThreshold } from "./types";
+import { qualifyThreshold, referralRewardInr } from "./types";
 import {
   decrementVerifiedReferralCount,
   getUserById,
@@ -57,7 +57,12 @@ async function creditReferrer(env: Env, api: Api, userId: number, delta: 1 | -1)
   // referrer who somehow passes the threshold without this branch running (a
   // racing increment, a manual correction, a count that dipped and recovered)
   // still qualifies on their next referral instead of being stranded.
-  const newlyQualified = await tryClaimQualification(env.DB, referrerId, qualifyThreshold(env));
+  const newlyQualified = await tryClaimQualification(
+    env.DB,
+    referrerId,
+    qualifyThreshold(env),
+    referralRewardInr(env)
+  );
   if (newlyQualified) await announceQualification(env, api, referrerId);
 }
 
