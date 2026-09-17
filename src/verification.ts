@@ -23,27 +23,33 @@ import { notifyAdmins, sendPremiumInvoice } from "./payments";
  * is derived from the live count instead, so it falls on its own.
  */
 export async function tryVerifyAndQualify(env: Env, api: Api, userId: number): Promise<void> {
-  const claimed = await tryClaimVerification(env.DB, userId);
-  if (claimed) {
-    await creditReferrer(env, api, userId, +1);
+  const claim = await tryClaimVerification(env.DB, userId);
+  if (claim.changed) {
+    await creditReferrer(env, api, claim.referredBy, +1);
     return;
   }
 
   // Not newly verified. They may instead have just stopped qualifying -- a
   // membership they had is gone. Revoking is the exact mirror of claiming and
   // is equally single-shot, so only one caller ever takes the credit back.
-  const revoked = await tryRevokeVerification(env.DB, userId);
-  if (revoked) await creditReferrer(env, api, userId, -1);
+  const revoke = await tryRevokeVerification(env.DB, userId);
+  if (revoke.changed) await creditReferrer(env, api, revoke.referredBy, -1);
 }
 
 /**
- * Moves the referrer's counted total by one in either direction. Reads the
- * referrer from the referred user, so a user with no referrer is simply a
- * no-op -- referrals are optional and there is nobody to credit.
+ * Moves the referrer's counted total by one in either direction.
+ *
+ * The referrer id comes from the RETURNING clause of the statement that just
+ * flipped verification, so no extra read is needed -- and it is necessarily the
+ * value as of that flip, which a follow-up SELECT could not guarantee. A user
+ * with no referrer is simply a no-op: referrals are optional.
  */
-async function creditReferrer(env: Env, api: Api, userId: number, delta: 1 | -1): Promise<void> {
-  const user = await getUserById(env.DB, userId);
-  const referrerId = user?.referred_by;
+async function creditReferrer(
+  env: Env,
+  api: Api,
+  referrerId: number | null,
+  delta: 1 | -1
+): Promise<void> {
   if (!referrerId) return;
 
   if (delta === -1) {

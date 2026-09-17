@@ -80,18 +80,23 @@ export async function createUserIfNotExists(
     code = generateReferralCode();
   }
 
-  await db
+  // RETURNING hands back the new row in the same round trip. On a lost race the
+  // conflict suppresses the insert and returns nothing, so we read the row that
+  // actually won -- correctness preserved, one fewer query in the common path.
+  const created = await db
     .prepare(
       `INSERT INTO users (telegram_user_id, referral_code, referred_by, username, first_name)
        VALUES (?, ?, ?, ?, ?)
-       ON CONFLICT(telegram_user_id) DO NOTHING`
+       ON CONFLICT(telegram_user_id) DO NOTHING
+       RETURNING *`
     )
     .bind(id, code, referredBy, username, firstName)
-    .run();
+    .first<UserRow>();
+  if (created) return created;
 
-  const created = await getUserById(db, id);
-  if (!created) throw new Error(`Failed to create or read user ${id}`);
-  return created;
+  const raced = await getUserById(db, id);
+  if (!raced) throw new Error(`Failed to create or read user ${id}`);
+  return raced;
 }
 
 export type ContactResult = "ok" | "phone_taken" | "no_user";
@@ -233,6 +238,36 @@ export async function isRequiredChat(db: D1Database, chatId: number): Promise<bo
   return row !== null;
 }
 
+export interface RequiredChatStatus extends RequiredChatRow {
+  /** 1 when the user currently holds a live membership in this chat. */
+  joined: number;
+}
+
+/**
+ * Every active required chat plus whether this user is in it, in one query.
+ * Replaces the pair of calls that previously fetched the list and the missing
+ * subset separately -- the caller needs both, and both came from the same rows.
+ */
+export async function getRequiredChatsWithStatus(
+  db: D1Database,
+  userId: number
+): Promise<RequiredChatStatus[]> {
+  const res = await db
+    .prepare(
+      `SELECT rc.*,
+              EXISTS (
+                SELECT 1 FROM join_requests jr
+                WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+              ) AS joined
+       FROM required_chats rc
+       WHERE rc.active = 1
+       ORDER BY rc.added_at ASC`
+    )
+    .bind(userId)
+    .all<RequiredChatStatus>();
+  return res.results ?? [];
+}
+
 /** The active required chats this user has not yet sent a join request to. */
 export async function getMissingRequiredChats(db: D1Database, userId: number): Promise<RequiredChatRow[]> {
   const res = await db
@@ -287,8 +322,14 @@ export async function recordJoinRequest(db: D1Database, userId: number, chatId: 
  * The `EXISTS` guard means an empty required set never auto-verifies everyone:
  * with no active chats the NOT EXISTS below would be vacuously true.
  */
-export async function tryClaimVerification(db: D1Database, userId: number): Promise<boolean> {
-  const res = await db
+export interface VerificationChange {
+  changed: boolean;
+  /** The referrer to credit or debit, read in the same statement. */
+  referredBy: number | null;
+}
+
+export async function tryClaimVerification(db: D1Database, userId: number): Promise<VerificationChange> {
+  const row = await db
     .prepare(
       `UPDATE users
        SET verified = 1, verified_at = datetime('now')
@@ -303,11 +344,12 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
                        SELECT 1 FROM join_requests jr
                        WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
                      )
-             )`
+             )
+       RETURNING referred_by`
     )
     .bind(userId, userId)
-    .run();
-  return (res.meta.changes ?? 0) > 0;
+    .first<{ referred_by: number | null }>();
+  return { changed: row !== null, referredBy: row?.referred_by ?? null };
 }
 
 /** Marks a membership live or lost. Returns true if the state actually changed. */
@@ -331,8 +373,8 @@ export async function setJoinRequestActive(
  * transition, so exactly one caller decrements the referrer -- the same
  * discipline that stops the increment double-counting.
  */
-export async function tryRevokeVerification(db: D1Database, userId: number): Promise<boolean> {
-  const res = await db
+export async function tryRevokeVerification(db: D1Database, userId: number): Promise<VerificationChange> {
+  const row = await db
     .prepare(
       `UPDATE users
        SET verified = 0, verified_at = NULL
@@ -345,11 +387,12 @@ export async function tryRevokeVerification(db: D1Database, userId: number): Pro
                        SELECT 1 FROM join_requests jr
                        WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
                      )
-             )`
+             )
+       RETURNING referred_by`
     )
     .bind(userId, userId)
-    .run();
-  return (res.meta.changes ?? 0) > 0;
+    .first<{ referred_by: number | null }>();
+  return { changed: row !== null, referredBy: row?.referred_by ?? null };
 }
 
 /** Floored at zero, so a double-decrement can never drive a count negative. */

@@ -29,7 +29,8 @@ const SQL = {
                        SELECT 1 FROM join_requests jr
                        WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
                      )
-             )`,
+             )
+       RETURNING referred_by`,
   revokeVerification: `UPDATE users
        SET verified = 0, verified_at = NULL
        WHERE telegram_user_id = ?
@@ -41,7 +42,8 @@ const SQL = {
                        SELECT 1 FROM join_requests jr
                        WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
                      )
-             )`,
+             )
+       RETURNING referred_by`,
   decrement: `UPDATE users SET verified_referral_count = MAX(0, verified_referral_count - 1)
        WHERE telegram_user_id = ?`,
   claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now'),
@@ -105,7 +107,10 @@ function addUser(db, id, { referredBy = null, contact = false, phone = null } = 
 function join(db, userId, chatId) {
   db.prepare("INSERT OR IGNORE INTO join_requests (telegram_user_id, chat_id) VALUES (?, ?)").run(userId, chatId);
 }
-const claim = (db, id) => db.prepare(SQL.claimVerification).run(id, id).changes > 0;
+// RETURNING yields a row only when the UPDATE matched, so presence of a row is
+// the same signal .changes > 0 used to give -- and it carries the referrer too.
+const claimRow = (db, id) => db.prepare(SQL.claimVerification).get(id, id);
+const claim = (db, id) => claimRow(db, id) !== undefined;
 const isVerified = (db, id) =>
   db.prepare("SELECT verified FROM users WHERE telegram_user_id = ?").get(id).verified === 1;
 
@@ -136,6 +141,23 @@ test("does not verify without a shared contact", () => {
   addUser(db, 2, { referredBy: 1, contact: false });
   for (const c of [-101, -102, -103]) join(db, 2, c);
   assert.equal(claim(db, 2), false);
+});
+
+test("the claim returns the referrer to credit, in the same statement", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2, { referredBy: 1, contact: true });
+  for (const c of [-101, -102, -103]) join(db, 2, c);
+  const row = claimRow(db, 2);
+  assert.ok(row, "a successful claim must return a row");
+  assert.equal(row.referred_by, 1, "the referrer to credit comes back with the flip, not from a second read");
+});
+
+test("a failed claim returns no row at all", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2, { referredBy: 1, contact: false });
+  assert.equal(claimRow(db, 2), undefined, "nothing changed, so nothing is returned");
 });
 
 test("verifies WITHOUT a referrer (referral is optional)", () => {
@@ -237,7 +259,8 @@ const rejoin = (db, userId, chatId) =>
        ON CONFLICT(telegram_user_id, chat_id) DO UPDATE SET active = 1`
     )
     .run(userId, chatId);
-const revoke = (db, id) => db.prepare(SQL.revokeVerification).run(id, id).changes > 0;
+const revokeRow = (db, id) => db.prepare(SQL.revokeVerification).get(id, id);
+const revoke = (db, id) => revokeRow(db, id) !== undefined;
 const decrement = (db, id) => db.prepare(SQL.decrement).run(id);
 const countOf = (db, id) =>
   db.prepare("SELECT verified_referral_count c FROM users WHERE telegram_user_id = ?").get(id).c;
@@ -250,6 +273,18 @@ function verifiedPair(db) {
   db.prepare("UPDATE users SET verified_referral_count = 1 WHERE telegram_user_id = 1").run();
   return db;
 }
+
+test("the revoke returns the referrer to debit, in the same statement", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2, { referredBy: 1, contact: true });
+  for (const c of [-101, -102, -103]) join(db, 2, c);
+  claim(db, 2);
+  db.prepare("UPDATE join_requests SET active = 0 WHERE telegram_user_id = 2 AND chat_id = -102").run();
+  const row = revokeRow(db, 2);
+  assert.ok(row, "a successful revoke must return a row");
+  assert.equal(row.referred_by, 1);
+});
 
 test("leaving one required chat revokes verification", () => {
   const db = verifiedPair(freshDb());

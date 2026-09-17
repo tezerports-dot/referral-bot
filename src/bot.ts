@@ -13,6 +13,7 @@ import {
   deactivateRequiredChat,
   getDirectReferrals,
   getMissingRequiredChats,
+  getRequiredChatsWithStatus,
   getUserById,
   getUserByPhone,
   getUserByReferralCode,
@@ -106,8 +107,10 @@ function menuKeyboard(user: UserRow): InlineKeyboard {
 
 /** The single "here is everything you need to do" message. */
 async function stepsMessage(env: Env, user: UserRow, prefix = ""): Promise<{ text: string; kb: InlineKeyboard }> {
-  const chats = await listRequiredChats(env.DB, true);
-  const missing = await getMissingRequiredChats(env.DB, user.telegram_user_id);
+  // One query returns every active chat and whether this user is in it; the
+  // caller needs both, and both come from the same rows.
+  const chats = await getRequiredChatsWithStatus(env.DB, user.telegram_user_id);
+  const missing = chats.filter((c) => !c.joined);
   const needsContact = !user.contact_shared;
 
   const lines = [
@@ -127,8 +130,10 @@ async function stepsMessage(env: Env, user: UserRow, prefix = ""): Promise<{ tex
 }
 
 /** Plain-text summary of where a user stands. */
-async function progressText(env: Env, userId: number): Promise<string> {
-  const user = await getUserById(env.DB, userId);
+async function progressText(env: Env, userId: number, preloaded?: UserRow | null): Promise<string> {
+  // Callers that already hold the row pass it in rather than paying for a
+  // second read of a value they just fetched.
+  const user = preloaded ?? (await getUserById(env.DB, userId));
   if (!user) return "Send /start first.";
 
   const threshold = qualifyThreshold(env);
@@ -285,7 +290,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       return;
     }
     if (user.referred_by || user.verified) {
-      await ctx.reply(await progressText(env, from.id));
+      await ctx.reply(await progressText(env, from.id, user));
       return;
     }
 
@@ -393,7 +398,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
           await ctx.reply("✅ You are verified!", { reply_markup: menuKeyboard(fresh) });
         } else {
           await ctx.answerCallbackQuery({ text: "Not complete yet — see below.", show_alert: false });
-          await ctx.reply(await progressText(env, from.id));
+          await ctx.reply(await progressText(env, from.id, fresh));
         }
         return;
       }
@@ -448,7 +453,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
           return;
         }
         if (!user.qualified) {
-          await ctx.reply(await progressText(env, from.id));
+          await ctx.reply(await progressText(env, from.id, user));
           return;
         }
         await sendPremiumInvoice(env, bot.api, from.id);
