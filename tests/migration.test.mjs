@@ -119,5 +119,93 @@ test("migration is idempotent enough to detect a double-run", () => {
   assert.throws(() => db.exec(runnable), /duplicate column/i);
 });
 
+console.log("\nFull migration chain (v1 -> 0002 -> 0003 -> 0004 -> 0005)");
+
+const strip = (sql) =>
+  sql.split("\n").filter((l) => !l.trim().startsWith("--")).join("\n");
+
+const chainDb = new DatabaseSync(":memory:");
+chainDb.exec(v1Schema);
+chainDb.prepare(
+  `INSERT INTO users (telegram_user_id, referral_code, contact_shared, verified, verified_referral_count)
+   VALUES (1, 'chain1', 1, 1, 200)`
+).run();
+
+let chainOk = true;
+for (const f of [
+  "0002_dynamic_requirements.sql",
+  "0003_phone_lookup_and_referrer.sql",
+  "0004_membership_and_rewards.sql",
+  "0005_reward_snapshot.sql",
+]) {
+  test(`${f} applies cleanly on top of the previous ones`, () => {
+    try {
+      chainDb.exec(strip(readFileSync(new URL(`../migrations/${f}`, import.meta.url), "utf8")));
+    } catch (err) {
+      chainOk = false;
+      throw err;
+    }
+  });
+}
+
+test("the fully migrated schema has every column the code reads", () => {
+  if (!chainOk) throw new Error("chain did not apply; earlier failure is the cause");
+  const cols = chainDb.prepare("SELECT name FROM pragma_table_info('users')").all().map((r) => r.name);
+  for (const c of [
+    "phone_normalized",
+    "phone_tail",
+    "premium_paid",
+    "premium_charge_id",
+    "reward_settled_inr",
+    "reward_settled_at",
+  ]) {
+    assert.ok(cols.includes(c), `users.${c} missing after the full chain`);
+  }
+  const jr = chainDb.prepare("SELECT name FROM pragma_table_info('join_requests')").all().map((r) => r.name);
+  assert.ok(jr.includes("active"), "join_requests.active missing after the full chain");
+});
+
+test("a user who qualified BEFORE 0005 gets a backfilled settlement", () => {
+  // The real upgrade scenario: they were already qualified when the migration
+  // ran, so there is no snapshot to take -- only a backfill can give them one.
+  const db2 = new DatabaseSync(":memory:");
+  db2.exec(v1Schema);
+  db2.prepare(
+    `INSERT INTO users (telegram_user_id, referral_code, contact_shared, verified,
+                        verified_referral_count, qualified, qualified_at)
+     VALUES (7, 'early7', 1, 1, 240, 1, '2026-01-01 00:00:00')`
+  ).run();
+  for (const f of [
+    "0002_dynamic_requirements.sql",
+    "0003_phone_lookup_and_referrer.sql",
+    "0004_membership_and_rewards.sql",
+    "0005_reward_snapshot.sql",
+  ]) {
+    db2.exec(strip(readFileSync(new URL(`../migrations/${f}`, import.meta.url), "utf8")));
+  }
+
+  const r = db2.prepare("SELECT reward_settled_inr i, reward_settled_at a FROM users WHERE telegram_user_id = 7").get();
+  assert.equal(r.i, 2000, "a pre-existing qualified user must not be left with a blank record");
+  assert.equal(r.a, "2026-01-01 00:00:00", "stamped with their original qualification time, not now");
+});
+
+test("an unqualified user is left alone by the backfill", () => {
+  const db3 = new DatabaseSync(":memory:");
+  db3.exec(v1Schema);
+  db3.prepare(
+    "INSERT INTO users (telegram_user_id, referral_code, verified_referral_count) VALUES (8, 'early8', 50)"
+  ).run();
+  for (const f of [
+    "0002_dynamic_requirements.sql",
+    "0003_phone_lookup_and_referrer.sql",
+    "0004_membership_and_rewards.sql",
+    "0005_reward_snapshot.sql",
+  ]) {
+    db3.exec(strip(readFileSync(new URL(`../migrations/${f}`, import.meta.url), "utf8")));
+  }
+  const r = db3.prepare("SELECT reward_settled_inr i FROM users WHERE telegram_user_id = 8").get();
+  assert.equal(r.i, null, "never qualified, so nothing is owed and nothing is recorded");
+});
+
 console.log(`\n${pass} passed, ${failures.length} failed`);
 if (failures.length) process.exit(1);

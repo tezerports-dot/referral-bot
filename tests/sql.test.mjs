@@ -44,7 +44,9 @@ const SQL = {
              )`,
   decrement: `UPDATE users SET verified_referral_count = MAX(0, verified_referral_count - 1)
        WHERE telegram_user_id = ?`,
-  claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now')
+  claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now'),
+              reward_settled_inr = MIN(verified_referral_count, ?) * ?,
+              reward_settled_at = datetime('now')
        WHERE telegram_user_id = ? AND qualified = 0 AND verified_referral_count >= ?`,
   setContactShared: `UPDATE users SET contact_shared = 1, phone_number = ?, phone_normalized = ?, phone_tail = ?
        WHERE telegram_user_id = ?
@@ -391,7 +393,10 @@ test("a referrer cannot be attached after verification", () => {
 
 console.log("\nQualification and payment");
 
-const qualify = (db, id, threshold) => db.prepare(SQL.claimQualification).run(id, threshold).changes > 0;
+const qualify = (db, id, threshold, rate = 10) =>
+  db.prepare(SQL.claimQualification).run(threshold, rate, id, threshold).changes > 0;
+const settled = (db, id) =>
+  db.prepare("SELECT reward_settled_inr i, reward_settled_at a FROM users WHERE telegram_user_id = ?").get(id);
 
 test("does not qualify below the threshold", () => {
   const db = freshDb();
@@ -434,6 +439,67 @@ test("a failed payout can be retried on the next referral", () => {
   db.prepare("UPDATE users SET qualified = 0, qualified_at = NULL WHERE telegram_user_id = 1").run();
   db.prepare("UPDATE users SET verified_referral_count = 201 WHERE telegram_user_id = 1").run();
   assert.equal(qualify(db, 1, 200), true);
+});
+
+console.log("\nThe settled figure is frozen at qualification");
+
+test("qualifying at exactly 200 settles ₹2000", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  db.prepare("UPDATE users SET verified_referral_count = 200 WHERE telegram_user_id = 1").run();
+  assert.equal(qualify(db, 1, 200, 10), true);
+  const { i, a } = settled(db, 1);
+  assert.equal(i, 2000);
+  assert.ok(a, "a settlement timestamp must be recorded");
+});
+
+test("the settled figure is capped even when the count overshot", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  db.prepare("UPDATE users SET verified_referral_count = 250 WHERE telegram_user_id = 1").run();
+  qualify(db, 1, 200, 10);
+  assert.equal(settled(db, 1).i, 2000, "250 referrals must still settle at the ₹2000 cap");
+});
+
+test("the settled figure does NOT erode when referrals later leave", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  db.prepare("UPDATE users SET verified_referral_count = 200 WHERE telegram_user_id = 1").run();
+  qualify(db, 1, 200, 10);
+  assert.equal(settled(db, 1).i, 2000);
+
+  // Three referrals leave: the live count falls, the settlement must not.
+  for (let n = 0; n < 3; n++) decrement(db, 1);
+  assert.equal(countOf(db, 1), 197, "live count follows departures down");
+  assert.equal(settled(db, 1).i, 2000, "the amount owed at qualification is fixed");
+});
+
+test("the snapshot is written once and never rewritten", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  db.prepare("UPDATE users SET verified_referral_count = 200 WHERE telegram_user_id = 1").run();
+  qualify(db, 1, 200, 10);
+  const first = settled(db, 1);
+
+  db.prepare("UPDATE users SET verified_referral_count = 400 WHERE telegram_user_id = 1").run();
+  assert.equal(qualify(db, 1, 200, 10), false, "already qualified");
+  assert.deepEqual(settled(db, 1), first, "a second attempt must not restate the settlement");
+});
+
+test("below the threshold nothing is settled", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  db.prepare("UPDATE users SET verified_referral_count = 199 WHERE telegram_user_id = 1").run();
+  assert.equal(qualify(db, 1, 200, 10), false);
+  assert.equal(settled(db, 1).i, null, "no qualification, no settlement record");
+});
+
+test("the settled figure follows the configured rate", () => {
+  const db = freshDb();
+  addUser(db, 1);
+  db.prepare("UPDATE users SET verified_referral_count = 200 WHERE telegram_user_id = 1").run();
+  qualify(db, 1, 200, 25);
+  assert.equal(settled(db, 1).i, 5000, "200 x ₹25");
 });
 
 const payPremium = (db, id, charge) => db.prepare(SQL.markPremiumPaid).run(charge, id).changes > 0;
