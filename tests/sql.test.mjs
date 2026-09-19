@@ -27,7 +27,7 @@ const SQL = {
                WHERE rc.active = 1
                  AND NOT EXISTS (
                        SELECT 1 FROM join_requests jr
-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
                      )
              )
        RETURNING referred_by`,
@@ -40,10 +40,37 @@ const SQL = {
                WHERE rc.active = 1
                  AND NOT EXISTS (
                        SELECT 1 FROM join_requests jr
-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
                      )
              )
        RETURNING referred_by`,
+  requiredChatsWithStatus: `SELECT rc.*,
+              EXISTS (
+                SELECT 1 FROM join_requests jr
+                WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
+              ) AS satisfied
+       FROM required_chats rc
+       WHERE rc.active = 1
+       ORDER BY rc.added_at ASC`,
+  missingChats: `SELECT rc.* FROM required_chats rc
+       WHERE rc.active = 1
+         AND NOT EXISTS (
+               SELECT 1 FROM join_requests jr
+               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
+             )
+       ORDER BY rc.added_at ASC`,
+  recordJoinRequest: `INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at, active)
+       VALUES (?, ?, 'pending', ?, 1)
+       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE
+         SET status = 'pending', event_at = excluded.event_at, active = 1
+         WHERE excluded.event_at > join_requests.event_at`,
+  markJoinMember: `INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at, active)
+       VALUES (?, ?, 'member', ?, 1)
+       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE
+         SET status = 'member', event_at = excluded.event_at, active = 1
+         WHERE excluded.event_at >= join_requests.event_at AND join_requests.status <> 'member'`,
+  markJoinEnded: `UPDATE join_requests SET status = 'ended', event_at = ?, active = 0
+       WHERE telegram_user_id = ? AND chat_id = ? AND status <> 'ended' AND ? >= event_at`,
   decrement: `UPDATE users SET verified_referral_count = MAX(0, verified_referral_count - 1)
        WHERE telegram_user_id = ?`,
   claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now'),
@@ -244,15 +271,14 @@ test("duplicate join requests are idempotent", () => {
 
 console.log("\nLeaving a chat stops the referral counting");
 
-const leave = (db, userId, chatId) =>
-  db.prepare("UPDATE join_requests SET active = 0 WHERE telegram_user_id = ? AND chat_id = ?").run(userId, chatId);
-const rejoin = (db, userId, chatId) =>
-  db
-    .prepare(
-      `INSERT INTO join_requests (telegram_user_id, chat_id, active) VALUES (?, ?, 1)
-       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE SET active = 1`
-    )
-    .run(userId, chatId);
+// Departure and rejoin go through the same statements the application runs.
+// `at` is the Telegram event time; tests advance it so each event is "newer".
+let clock = 1_000;
+const tick = () => ++clock;
+const leave = (db, userId, chatId, at = tick()) =>
+  db.prepare(SQL.markJoinEnded).run(at, userId, chatId, at).changes > 0;
+const rejoin = (db, userId, chatId, at = tick()) =>
+  db.prepare(SQL.recordJoinRequest).run(userId, chatId, at).changes > 0;
 const revokeRow = (db, id) => db.prepare(SQL.revokeVerification).get(id, id);
 const revoke = (db, id) => revokeRow(db, id) !== undefined;
 const decrement = (db, id) => db.prepare(SQL.decrement).run(id);
@@ -274,7 +300,7 @@ test("the revoke returns the referrer to debit, in the same statement", () => {
   addUser(db, 2, { referredBy: 1, contact: true });
   for (const c of [-101, -102, -103]) join(db, 2, c);
   claim(db, 2);
-  db.prepare("UPDATE join_requests SET active = 0 WHERE telegram_user_id = 2 AND chat_id = -102").run();
+  leave(db, 2, -102);
   const row = revokeRow(db, 2);
   assert.ok(row, "a successful revoke must return a row");
   assert.equal(row.referred_by, 1);
@@ -332,6 +358,215 @@ test("the count can never go negative", () => {
   decrement(db, 1);
   decrement(db, 1);
   assert.equal(countOf(db, 1), 0, "MAX(0, ...) must floor it");
+});
+
+console.log("\nPending request vs actual membership");
+
+const setState = (db, u, c, state, at = tick()) => {
+  if (state === "pending") return rejoin(db, u, c, at);
+  if (state === "member") return db.prepare(SQL.markJoinMember).run(u, c, at).changes > 0;
+  if (state === "ended") return leave(db, u, c, at);
+  throw new Error(state);
+};
+const statusOf = (db, u, c) =>
+  db.prepare("SELECT status, active, event_at FROM join_requests WHERE telegram_user_id = ? AND chat_id = ?").get(u, c);
+const satisfiedOf = (db, u) =>
+  Object.fromEntries(db.prepare(SQL.requiredChatsWithStatus).all(u).map((r) => [r.chat_id, r.satisfied]));
+const missingOf = (db, u) => db.prepare(SQL.missingChats).all(u).map((r) => r.chat_id);
+
+/** A referred user with contact shared and a state for each of -101..-103. */
+function withStates(states) {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2, { referredBy: 1, contact: true });
+  [-101, -102, -103].forEach((c, i) => states[i] && setState(db, 2, c, states[i]));
+  return db;
+}
+
+test("a PENDING request satisfies the requirement", () => {
+  const db = withStates(["pending", "pending", "pending"]);
+  assert.equal(claim(db, 2), true, "verification must not wait for an admin");
+  assert.deepEqual(satisfiedOf(db, 2), { [-101]: 1, [-102]: 1, [-103]: 1 });
+  assert.deepEqual(missingOf(db, 2), []);
+});
+
+test("actual MEMBERSHIP satisfies the requirement", () => {
+  const db = withStates(["member", "member", "member"]);
+  assert.equal(claim(db, 2), true);
+  assert.deepEqual(missingOf(db, 2), []);
+});
+
+test("pending and member can be mixed across chats", () => {
+  const db = withStates(["pending", "member", "pending"]);
+  assert.equal(claim(db, 2), true);
+});
+
+test("an ENDED request does not satisfy the requirement", () => {
+  const db = withStates(["pending", "pending", "ended"]);
+  assert.equal(claim(db, 2), false);
+  assert.deepEqual(satisfiedOf(db, 2), { [-101]: 1, [-102]: 1, [-103]: 0 });
+  assert.deepEqual(missingOf(db, 2), [-103]);
+});
+
+test("NO row at all does not satisfy the requirement", () => {
+  const db = withStates(["pending", "pending", null]);
+  assert.equal(claim(db, 2), false);
+  assert.deepEqual(missingOf(db, 2), [-103]);
+});
+
+test("the three queries that ask 'is this satisfied' can never disagree", () => {
+  // The user's instruction: one coherent definition, not one fixed query and
+  // one left on the old meaning. Check every state against all three.
+  for (const state of ["pending", "member", "ended", null]) {
+    const db = withStates([state, "pending", "pending"]);
+    const satisfied = satisfiedOf(db, 2)[-101] === 1;
+    const missing = missingOf(db, 2).includes(-101);
+    assert.equal(satisfied, !missing, `status=${state}: satisfied vs missing disagree`);
+    assert.equal(claim(db, 2), satisfied, `status=${state}: claim disagrees with the status query`);
+  }
+});
+
+test("the admin approving a pending request changes nothing for the referrer", () => {
+  const db = withStates(["pending", "pending", "pending"]);
+  assert.equal(claim(db, 2), true);
+  // chat_member arrives: pending -> member. Both satisfy, so nothing to revoke.
+  assert.equal(setState(db, 2, -102, "member"), true);
+  assert.equal(revoke(db, 2), false, "approval must not un-verify or re-credit anyone");
+  assert.equal(claim(db, 2), false, "already verified: no second credit");
+  assert.equal(isVerified(db, 2), true);
+});
+
+test("a request that is later removed stops satisfying, and revokes once", () => {
+  const db = withStates(["pending", "pending", "pending"]);
+  claim(db, 2);
+  assert.equal(setState(db, 2, -101, "ended"), true, "kicked/left while still requested");
+  assert.equal(revoke(db, 2), true);
+  assert.equal(revoke(db, 2), false);
+});
+
+test("re-requesting after an ended request satisfies again", () => {
+  const db = withStates(["pending", "pending", "ended"]);
+  assert.equal(claim(db, 2), false);
+  assert.equal(setState(db, 2, -103, "pending"), true);
+  assert.equal(claim(db, 2), true);
+});
+
+console.log("\nDuplicate and out-of-order webhook deliveries");
+
+test("a duplicate join request changes nothing", () => {
+  const db = freshDb();
+  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 500).changes, 1);
+  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 500).changes, 0, "same event again is a no-op");
+  assert.equal(statusOf(db, 2, -101).status, "pending");
+});
+
+test("a stale duplicate request cannot demote an approved member", () => {
+  const db = freshDb();
+  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
+  db.prepare(SQL.markJoinMember).run(2, -101, 600);
+  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 500).changes, 0);
+  assert.equal(statusOf(db, 2, -101).status, "member");
+});
+
+test("a stale duplicate request cannot resurrect a departure", () => {
+  const db = freshDb();
+  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
+  db.prepare(SQL.markJoinMember).run(2, -101, 600);
+  db.prepare(SQL.markJoinEnded).run(700, 2, -101, 700);
+  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 500).changes, 0, "old request replayed");
+  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 600).changes, 0, "old approval replayed");
+  assert.equal(statusOf(db, 2, -101).status, "ended");
+});
+
+test("a stale departure cannot end a request the user has since re-sent", () => {
+  const db = freshDb();
+  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
+  db.prepare(SQL.markJoinEnded).run(600, 2, -101, 600);
+  db.prepare(SQL.recordJoinRequest).run(2, -101, 700); // re-requests
+  assert.equal(db.prepare(SQL.markJoinEnded).run(600, 2, -101, 600).changes, 0, "old 'left' replayed");
+  assert.equal(statusOf(db, 2, -101).status, "pending");
+});
+
+test("a genuinely newer request after leaving is honoured", () => {
+  const db = freshDb();
+  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
+  db.prepare(SQL.markJoinEnded).run(600, 2, -101, 600);
+  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 700).changes, 1);
+  assert.equal(statusOf(db, 2, -101).status, "pending");
+});
+
+test("a duplicate membership event changes nothing", () => {
+  const db = freshDb();
+  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 500).changes, 1);
+  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 500).changes, 0);
+});
+
+test("approval in the same second as the request still promotes it", () => {
+  const db = freshDb();
+  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
+  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 500).changes, 1);
+  assert.equal(statusOf(db, 2, -101).status, "member");
+});
+
+test("a departure from a chat the user never touched records nothing", () => {
+  const db = freshDb();
+  assert.equal(db.prepare(SQL.markJoinEnded).run(500, 2, -101, 500).changes, 0);
+  assert.equal(db.prepare("SELECT COUNT(*) c FROM join_requests").get().c, 0, "must not create a row");
+});
+
+test("a member who never sent a request through the bot is recognised", () => {
+  const db = freshDb();
+  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 500).changes, 1);
+  assert.equal(statusOf(db, 2, -101).status, "member");
+});
+
+test("a legacy row (event_at = 0) yields to the first real event", () => {
+  const db = freshDb();
+  db.prepare("INSERT INTO join_requests (telegram_user_id, chat_id, status) VALUES (2, -101, 'member')").run();
+  assert.equal(statusOf(db, 2, -101).event_at, 0);
+  assert.equal(db.prepare(SQL.markJoinEnded).run(500, 2, -101, 500).changes, 1);
+});
+
+console.log("\nSchema guarantees");
+
+test("`active` stays a faithful mirror of (status <> 'ended') through every transition", () => {
+  const db = freshDb();
+  const seq = ["pending", "member", "ended", "pending", "ended", "member"];
+  for (const st of seq) {
+    setState(db, 2, -101, st);
+    const r = statusOf(db, 2, -101);
+    assert.equal(r.status, st);
+    assert.equal(r.active, st === "ended" ? 0 : 1, `active drifted at ${st}`);
+  }
+});
+
+test("an unknown status is rejected by the CHECK constraint", () => {
+  const db = freshDb();
+  assert.throws(
+    () => db.prepare("INSERT INTO join_requests (telegram_user_id, chat_id, status) VALUES (2, -101, 'approved')").run(),
+    /CHECK/i
+  );
+});
+
+test("no application code reads the ambiguous `active` column of join_requests", () => {
+  // Every statement that decides 'satisfied' must use status IN ('pending','member').
+  // `jr.active` (or a bare join_requests.active read) means one path kept the old meaning.
+  assert.ok(!/\bjr\.active\b/.test(dbSource), "src/db.ts still reads jr.active");
+  const other = ["bot.ts", "verification.ts", "payments.ts", "index.ts"].map((f) =>
+    readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8")
+  );
+  for (const src of other) assert.ok(!/join_requests[\s\S]{0,80}\bactive\b/.test(src), "raw join_requests.active read outside db.ts");
+  assert.ok(!/setJoinRequestActive/.test(dbSource), "the old boolean setter still exists");
+});
+
+test("every join_requests lookup in db.ts uses the one satisfied predicate", () => {
+  // A subquery over `join_requests jr` that omits the predicate (or filters on
+  // some other status) would silently redefine "satisfied" for that path.
+  const lookups = dbSource.match(/FROM join_requests jr/g) ?? [];
+  const predicate = dbSource.match(/jr\.status IN \('pending', 'member'\)/g) ?? [];
+  assert.equal(lookups.length, 4, "status query, missing query, claim, revoke -- add a test if a fifth appears");
+  assert.equal(predicate.length, lookups.length, "a join_requests lookup is missing the shared predicate");
+  assert.ok(!/jr\.status\s*(=|<>|!=)/.test(dbSource), "a lookup compares status directly instead of using the predicate");
 });
 
 console.log("\nPhone-number uniqueness (anti-sybil)");

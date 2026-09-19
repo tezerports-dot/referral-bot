@@ -223,14 +223,22 @@ export async function isRequiredChat(db: D1Database, chatId: number): Promise<bo
 }
 
 export interface RequiredChatStatus extends RequiredChatRow {
-  /** 1 when the user currently holds a live membership in this chat. */
-  joined: number;
+  /**
+   * 1 when this chat's requirement is met for the user: they hold a pending
+   * join request OR are an actual member. See join_requests.status in schema.sql.
+   */
+  satisfied: number;
 }
 
 /**
- * Every active required chat plus whether this user is in it, in one query.
- * Replaces the pair of calls that previously fetched the list and the missing
- * subset separately -- the caller needs both, and both came from the same rows.
+ * Every active required chat plus whether this user has satisfied it, in one
+ * query. Replaces the pair of calls that previously fetched the list and the
+ * missing subset separately -- the caller needs both, and both came from the
+ * same rows.
+ *
+ * "Satisfied" is `status IN ('pending', 'member')` and is written out
+ * identically in every statement below that asks the question. There is
+ * deliberately one definition, so no path can disagree about it.
  */
 export async function getRequiredChatsWithStatus(
   db: D1Database,
@@ -241,8 +249,8 @@ export async function getRequiredChatsWithStatus(
       `SELECT rc.*,
               EXISTS (
                 SELECT 1 FROM join_requests jr
-                WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
-              ) AS joined
+                WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
+              ) AS satisfied
        FROM required_chats rc
        WHERE rc.active = 1
        ORDER BY rc.added_at ASC`
@@ -252,7 +260,7 @@ export async function getRequiredChatsWithStatus(
   return res.results ?? [];
 }
 
-/** The active required chats this user has not yet sent a join request to. */
+/** The active required chats this user has neither requested to join nor joined. */
 export async function getMissingRequiredChats(db: D1Database, userId: number): Promise<RequiredChatRow[]> {
   const res = await db
     .prepare(
@@ -260,7 +268,7 @@ export async function getMissingRequiredChats(db: D1Database, userId: number): P
        WHERE rc.active = 1
          AND NOT EXISTS (
                SELECT 1 FROM join_requests jr
-               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
              )
        ORDER BY rc.added_at ASC`
     )
@@ -269,23 +277,99 @@ export async function getMissingRequiredChats(db: D1Database, userId: number): P
   return res.results ?? [];
 }
 
-// ---- Join requests ----
+// ---- Join requests and membership ----
+//
+// Three transitions over join_requests.status (see schema.sql):
+//
+//   chat_join_request  ->  pending   recordJoinRequest
+//   chat_member in     ->  member    markJoinMember   (also getChatMember)
+//   chat_member out    ->  ended     markJoinEnded
+//
+// Each takes the Telegram timestamp of the event and applies only if the row has
+// not already moved past it. Telegram may redeliver an update after a retry, and
+// documents update_id as the way to "restore the correct update sequence, should
+// they get out of order" -- an unguarded write would let a stale duplicate
+// resurrect a request that has ended, or end one the user has since re-sent.
+//
+// Each returns true only when the row actually changed, so a duplicate delivery
+// is a cheap no-op and the caller can skip re-evaluating verification.
+//
+// `active` is written alongside as a deprecated mirror (status <> 'ended'); no
+// code in this repository reads it.
 
 /**
  * Records that this Telegram user ID sent a join request to this chat ID.
- * Idempotent: Telegram may redeliver the same webhook update on retry, and the
- * (telegram_user_id, chat_id) primary key makes a duplicate a no-op. Rows are
- * written regardless of whether the user has registered with the bot yet, so a
- * join request sent before /start is never lost.
+ * Written regardless of whether the user has registered with the bot yet. The
+ * request is PENDING until an admin decides it -- the bot never approves it --
+ * and a pending request satisfies the requirement.
+ *
+ * Strictly newer than the stored event: a duplicate of the same request (same
+ * timestamp) changes nothing, so it can never demote a row that has since
+ * become 'member'.
  */
-export async function recordJoinRequest(db: D1Database, userId: number, chatId: number): Promise<void> {
-  await db
+export async function recordJoinRequest(
+  db: D1Database,
+  userId: number,
+  chatId: number,
+  eventAt: number
+): Promise<boolean> {
+  const res = await db
     .prepare(
-      `INSERT INTO join_requests (telegram_user_id, chat_id, active) VALUES (?, ?, 1)
-       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE SET active = 1`
+      `INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at, active)
+       VALUES (?, ?, 'pending', ?, 1)
+       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE
+         SET status = 'pending', event_at = excluded.event_at, active = 1
+         WHERE excluded.event_at > join_requests.event_at`
     )
-    .bind(userId, chatId)
+    .bind(userId, chatId, eventAt)
     .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
+ * Records that the user is actually in the chat: an admin approved their
+ * request, they joined some other way, or a getChatMember lookup found them
+ * there. Creates the row when there is none, so a member is recognised even if
+ * they never went through this bot's join-request flow.
+ */
+export async function markJoinMember(
+  db: D1Database,
+  userId: number,
+  chatId: number,
+  eventAt: number
+): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at, active)
+       VALUES (?, ?, 'member', ?, 1)
+       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE
+         SET status = 'member', event_at = excluded.event_at, active = 1
+         WHERE excluded.event_at >= join_requests.event_at AND join_requests.status <> 'member'`
+    )
+    .bind(userId, chatId, eventAt)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
+}
+
+/**
+ * Records that the user left, was removed, or is otherwise no longer requested
+ * or a member. Never creates a row: a departure from a chat this user never
+ * touched is nothing to remember.
+ */
+export async function markJoinEnded(
+  db: D1Database,
+  userId: number,
+  chatId: number,
+  eventAt: number
+): Promise<boolean> {
+  const res = await db
+    .prepare(
+      `UPDATE join_requests SET status = 'ended', event_at = ?, active = 0
+       WHERE telegram_user_id = ? AND chat_id = ? AND status <> 'ended' AND ? >= event_at`
+    )
+    .bind(eventAt, userId, chatId, eventAt)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
 }
 
 // ---- Verification ----
@@ -293,6 +377,10 @@ export async function recordJoinRequest(db: D1Database, userId: number, chatId: 
 /**
  * Atomically checks every verification condition against the *current* active
  * required-chat set and flips verified 0->1 in a single statement.
+ *
+ * "Every required chat satisfied" means a pending join request OR actual
+ * membership -- NOT admin approval. A user is verified, and their referrer is
+ * credited, before any admin has looked at their request.
  *
  * A referrer is NOT required: an organic user who finds the bot directly can
  * verify on their own. Referrals only matter for reaching the premium
@@ -326,7 +414,7 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
                WHERE rc.active = 1
                  AND NOT EXISTS (
                        SELECT 1 FROM join_requests jr
-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
                      )
              )
        RETURNING referred_by`
@@ -336,24 +424,10 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
   return { changed: row !== null, referredBy: row?.referred_by ?? null };
 }
 
-/** Marks a membership live or lost. Returns true if the state actually changed. */
-export async function setJoinRequestActive(
-  db: D1Database,
-  userId: number,
-  chatId: number,
-  active: boolean
-): Promise<boolean> {
-  const res = await db
-    .prepare("UPDATE join_requests SET active = ? WHERE telegram_user_id = ? AND chat_id = ? AND active <> ?")
-    .bind(active ? 1 : 0, userId, chatId, active ? 1 : 0)
-    .run();
-  return (res.meta.changes ?? 0) > 0;
-}
-
 /**
  * The mirror image of tryClaimVerification: drops verified 1->0 in one
- * statement when the user no longer holds a live membership in every active
- * required chat. Returns true only for the call that performed the
+ * statement when the user no longer satisfies every active required chat (no
+ * pending request and no membership). Returns true only for the call that performed the
  * transition, so exactly one caller decrements the referrer -- the same
  * discipline that stops the increment double-counting.
  */
@@ -369,7 +443,7 @@ export async function tryRevokeVerification(db: D1Database, userId: number): Pro
                WHERE rc.active = 1
                  AND NOT EXISTS (
                        SELECT 1 FROM join_requests jr
-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
                      )
              )
        RETURNING referred_by`

@@ -19,14 +19,15 @@ import {
   invalidateRequiredChatCache,
   isRequiredChatCached,
   listRequiredChats,
+  markJoinEnded,
+  markJoinMember,
   recordJoinRequest,
   setContactShared,
-  setJoinRequestActive,
   setRequiredChatInviteLink,
   type RequiredChatRow,
   type UserRow,
 } from "./db";
-import { tryVerifyAndQualify } from "./verification";
+import { membershipOf, tryVerifyAndQualify } from "./verification";
 import { isAdmin } from "./admin";
 import {
   handlePreCheckout,
@@ -109,7 +110,7 @@ async function stepsMessage(env: Env, user: UserRow, prefix = ""): Promise<{ tex
   // One query returns every active chat and whether this user is in it; the
   // caller needs both, and both come from the same rows.
   const chats = await getRequiredChatsWithStatus(env.DB, user.telegram_user_id);
-  const missing = chats.filter((c) => !c.joined);
+  const missing = chats.filter((c) => !c.satisfied);
   const needsContact = !user.contact_shared;
 
   const lines = [
@@ -121,7 +122,7 @@ async function stepsMessage(env: Env, user: UserRow, prefix = ""): Promise<{ tex
       `${missing.length === 0 ? "✅ done" : `⬜ ${chats.length - missing.length}/${chats.length} done`}`,
     "3️⃣ Tap “✅ Verify me” when both are complete",
     "",
-    "Join requests are approved automatically once you have shared your contact.",
+    "An admin reviews each join request. You do not need to wait for that — tap “✅ Verify me” as soon as you have sent them.",
     "",
     `Your referral link:\nhttps://t.me/${env.BOT_USERNAME}?start=${user.referral_code}`,
   ];
@@ -184,7 +185,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       from.username ?? null,
       from.first_name ?? null
     );
-    await tryVerifyAndQualify(env, bot.api, from.id);
+    await tryVerifyAndQualify(env, bot.api, from.id, { reconcile: true });
 
     const fresh = (await getUserById(env.DB, from.id)) ?? user;
 
@@ -284,7 +285,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
       return;
     }
 
-    await tryVerifyAndQualify(env, bot.api, from.id);
+    await tryVerifyAndQualify(env, bot.api, from.id, { reconcile: true });
     const fresh = await getUserById(env.DB, from.id);
     if (fresh?.verified) {
       await ctx.reply("✅ Contact received — you are now fully verified!", { reply_markup: { remove_keyboard: true } });
@@ -319,7 +320,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
         return;
       }
       case "verify": {
-        await tryVerifyAndQualify(env, bot.api, from.id);
+        await tryVerifyAndQualify(env, bot.api, from.id, { reconcile: true });
         const fresh = await getUserById(env.DB, from.id);
         if (fresh?.verified) {
           await ctx.answerCallbackQuery({ text: "✅ Verified!", show_alert: false });
@@ -393,7 +394,12 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     }
   });
 
-  // ---- Join requests: only people who came through the bot get in ----
+  // ---- Join requests: recorded here, approved by a human ----
+  //
+  // The bot NEVER approves a join request. A Telegram admin approves or rejects
+  // each one. Sending the request is what satisfies this bot's requirement -- a
+  // pending request counts -- so the user can verify (and their referrer is
+  // credited) without waiting for that decision.
 
   bot.on("chat_join_request", async (ctx) => {
     const req = ctx.chatJoinRequest;
@@ -402,7 +408,9 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     const user = await getUserById(env.DB, req.from.id);
 
     // Anyone who did not onboard through the bot is turned away, which is what
-    // makes the bot the only route into these chats even if a link leaks.
+    // makes the bot the only route into these chats even if a link leaks. This
+    // is the one automatic decision the bot still takes, and it is a refusal:
+    // nothing here approves anyone.
     if (!user || !user.contact_shared) {
       try {
         await bot.api.declineChatJoinRequest(req.chat.id, req.from.id);
@@ -413,39 +421,44 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
         .sendMessage(
           req.from.id,
           `To join, start @${env.BOT_USERNAME} first and share your contact. ` +
-            "Your request was not approved because it did not come through the bot."
+            "Your request was declined because it did not come through the bot."
         )
         .catch(() => {});
       return;
     }
 
-    await recordJoinRequest(env.DB, req.from.id, req.chat.id);
-    try {
-      await bot.api.approveChatJoinRequest(req.chat.id, req.from.id);
-    } catch (err) {
-      console.error(`Failed to approve join request from ${req.from.id}:`, err);
-    }
+    await recordJoinRequest(env.DB, req.from.id, req.chat.id, req.date);
+    // Runs even when the row was already recorded: if an earlier delivery wrote
+    // it and then failed before verifying, Telegram's retry must still finish
+    // the job. Verification is single-shot, so re-running it is harmless.
     await tryVerifyAndQualify(env, bot.api, req.from.id);
   });
 
-  // ---- Membership changes: only people who STAY are counted ----
+  // ---- Membership changes: keeps "actual member" in step with Telegram ----
+  //
+  // Needs "chat_member" in the webhook's allowed_updates AND the bot to be an
+  // admin of the chat, or Telegram never sends these. This is for TRACKING
+  // membership (an approval, a departure); verification does not wait for it.
 
   bot.on("chat_member", async (ctx) => {
     const upd = ctx.chatMember;
     if (!(await isRequiredChatCached(env.DB, upd.chat.id))) return;
 
-    const status = upd.new_chat_member.status;
-    const present = status === "member" || status === "administrator" || status === "creator";
-    const gone = status === "left" || status === "kicked";
-    if (!present && !gone) return; // "restricted" etc. leave the state as-is
+    const userId = upd.new_chat_member.user.id;
+    const presence = membershipOf(upd.new_chat_member);
+    if (presence === "unknown") return; // leave the stored state as-is
 
-    const changed = await setJoinRequestActive(env.DB, upd.new_chat_member.user.id, upd.chat.id, present);
+    const changed =
+      presence === "present"
+        ? await markJoinMember(env.DB, userId, upd.chat.id, upd.date)
+        : await markJoinEnded(env.DB, userId, upd.chat.id, upd.date);
     if (!changed) return;
 
     // Re-evaluates in whichever direction the new state calls for: a departure
     // revokes verification and takes the referrer's credit back, a rejoin
-    // restores both.
-    await tryVerifyAndQualify(env, bot.api, upd.new_chat_member.user.id);
+    // restores both. Approving a pending request only turns 'pending' into
+    // 'member' -- both satisfy -- so it changes nothing the referrer sees.
+    await tryVerifyAndQualify(env, bot.api, userId);
   });
 
   // ---- Telegram Stars payments ----

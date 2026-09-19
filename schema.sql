@@ -70,24 +70,49 @@ CREATE TABLE IF NOT EXISTS required_chats (
 
 CREATE INDEX IF NOT EXISTS idx_required_chats_active ON required_chats(active);
 
--- One row per (user, chat) join request, and the single source of truth for
--- "did this Telegram user ID request to join this chat".
+-- One row per (user, chat), and the single source of truth for where a Telegram
+-- user ID stands with a required chat.
 --
--- Independent of whether the user has registered with the bot yet, so a join
--- request that arrives before /start is never lost. The composite primary key
+-- Independent of whether the user has registered with the bot yet, so a state
+-- change that arrives before /start is never lost. The composite primary key
 -- makes duplicate Telegram webhook deliveries (retries) idempotent.
+--
+-- `status` keeps two different facts apart that a single boolean used to blur:
+--
+--   pending  the user sent a join request that no admin has decided yet.
+--            Set by chat_join_request. SATISFIES the requirement.
+--   member   the user is actually in the chat. Set by chat_member, or by a
+--            getChatMember lookup. SATISFIES the requirement.
+--   ended    the user left, was removed, or their request was withdrawn.
+--            Does NOT satisfy the requirement.
+--
+-- "Requirement satisfied" is therefore exactly:  status IN ('pending','member').
+-- A requirement with no row at all is not satisfied either.
+--
+-- Telegram tells a bot nothing when an admin DECLINES a request, so a pending
+-- row cannot be ended by a decline -- only by a later left/kicked event or by
+-- the user requesting again. See README "Pending requests and declines".
 CREATE TABLE IF NOT EXISTS join_requests (
   telegram_user_id INTEGER NOT NULL,
   chat_id          INTEGER NOT NULL,
   requested_at     TEXT NOT NULL DEFAULT (datetime('now')),
-  -- 1 while the user is in the chat, 0 once they leave or are removed. Only
-  -- live memberships satisfy a requirement, so a member who joins and then
-  -- leaves stops counting for their referrer.
+  status           TEXT NOT NULL DEFAULT 'pending'
+                   CHECK (status IN ('pending', 'member', 'ended')),
+  -- Unix time (seconds) of the Telegram event that last set `status`. A state
+  -- change is applied only if it is not older than this, so a redelivered or
+  -- out-of-order update can neither resurrect an ended request nor end a newer
+  -- one. 0 for rows that predate the column.
+  event_at         INTEGER NOT NULL DEFAULT 0,
+  -- DEPRECATED. Mirrors (status <> 'ended') so that rolling back to a build
+  -- that still reads it behaves sensibly. The application never reads it.
   active           INTEGER NOT NULL DEFAULT 1,
   PRIMARY KEY (telegram_user_id, chat_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_join_requests_active
   ON join_requests(telegram_user_id, active);
+
+CREATE INDEX IF NOT EXISTS idx_join_requests_status
+  ON join_requests(telegram_user_id, status);
 
 CREATE INDEX IF NOT EXISTS idx_join_requests_chat ON join_requests(chat_id);

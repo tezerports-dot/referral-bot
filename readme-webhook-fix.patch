@@ -1,0 +1,25 @@
+diff --git a/README.md b/README.md
+index 32a99fc..fb10bc0 100644
+--- a/README.md
++++ b/README.md
+@@ -31,12 +31,16 @@ version ignores the header, so adding it now is harmless; the new version
+ is rejected.
+ 
+ ```bash
+-curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook\
+-?url=https://<your-worker>.workers.dev/webhook/<WEBHOOK_SECRET>\
+-&secret_token=<WEBHOOK_SECRET>\
+-&allowed_updates=[\"message\",\"callback_query\",\"chat_join_request\",\"chat_member\",\"my_chat_member\",\"pre_checkout_query\"]"
++curl -sS "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
++  --data-urlencode "url=https://<your-worker>.workers.dev/webhook/<WEBHOOK_SECRET>" \
++  --data-urlencode "secret_token=<WEBHOOK_SECRET>" \
++  --data-urlencode 'allowed_updates=["message","callback_query","chat_join_request","chat_member","my_chat_member","pre_checkout_query"]'
+ ```
+ 
++(The list is sent as a request body on purpose: inside a URL, curl reads the square
++brackets as a range pattern and fails with `bad range specification` unless you
++add `-g`.)
++
+ `allowed_updates` matters: `chat_join_request`, `chat_member` and
+ `my_chat_member` are **not** delivered by default, `callback_query` carries every
+ inline button (including **Verify**), and `pre_checkout_query` is needed for
