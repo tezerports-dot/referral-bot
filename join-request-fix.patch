@@ -1,0 +1,2086 @@
+diff --git a/README.md b/README.md
+index e1769be..32a99fc 100644
+--- a/README.md
++++ b/README.md
+@@ -17,7 +17,7 @@ currently deployed code keeps working unchanged afterwards.
+ 
+ ```bash
+ npm install
+-npm test                      # 36 checks, offline, no account needed
++npm test                      # offline, no account needed
+ npm run db:migrate:remote
+ ```
+ 
+@@ -34,12 +34,16 @@ is rejected.
+ curl "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook\
+ ?url=https://<your-worker>.workers.dev/webhook/<WEBHOOK_SECRET>\
+ &secret_token=<WEBHOOK_SECRET>\
+-&allowed_updates=[\"message\",\"chat_join_request\",\"pre_checkout_query\",\"my_chat_member\"]"
++&allowed_updates=[\"message\",\"callback_query\",\"chat_join_request\",\"chat_member\",\"my_chat_member\",\"pre_checkout_query\"]"
+ ```
+ 
+-`allowed_updates` matters: `chat_join_request` and `my_chat_member` are **not**
+-delivered by default, and `pre_checkout_query` is needed for Stars payments.
+-Setting the list replaces it wholesale, so pass every type you need.
++`allowed_updates` matters: `chat_join_request`, `chat_member` and
++`my_chat_member` are **not** delivered by default, `callback_query` carries every
++inline button (including **Verify**), and `pre_checkout_query` is needed for
++Stars payments. Setting the list replaces it wholesale, so pass every type the
++bot handles — `tests/webhook.test.mjs` fails if this list and `src/bot.ts` ever
++disagree. `chat_member` is only delivered for chats where the bot is an
++**administrator**.
+ 
+ **3. Set `PREMIUM_GROUP_CHAT_ID`** in `wrangler.toml` — it ships as
+ `REPLACE_ME`, and until it holds the real chat ID nobody can receive a premium
+@@ -94,14 +98,101 @@ and a ready-to-paste `/addchat` command automatically.
+ - An **empty** list verifies nobody. This is deliberate — a bug that cleared
+   the list would otherwise verify your entire user base at once.
+ 
++## Join requests: manual approval, and a pending request counts
++
++Required chats use **approval-required invite links**. What the bot does with the
++resulting join requests:
++
++- **It never approves them.** A Telegram admin approves or declines each request
++  in the chat's own join-request list. Nothing in `src/` calls
++  `approveChatJoinRequest`, and a test fails if that ever changes.
++- **It records them.** Sending the request is what satisfies this bot's
++  requirement for that chat — *before* any admin has looked at it.
++- **Verification and the referrer's credit do not wait for approval.** A user
++  who has sent a request to every required chat can verify immediately, and
++  their referrer gets +1 at that moment.
++- The one automatic decision left is a *refusal*: a request from someone who
++  never started the bot and shared their contact is declined, so a leaked link
++  still cannot skip the bot.
++
++Per `(user, chat)`, `join_requests.status` holds one of three states:
++
++| `status` | Meaning | Set by | Satisfies the requirement? |
++|---|---|---|---|
++| *(no row)* | never asked, never joined | — | **No** |
++| `pending` | sent a request; no admin decision yet | `chat_join_request` | **Yes** |
++| `member` | actually in the chat | `chat_member`, or a `getChatMember` lookup | **Yes** |
++| `ended` | left, was removed, or was withdrawn | `chat_member` (`left` / `kicked`) | **No** |
++
++"Satisfied" is written one way — `status IN ('pending', 'member')` — in every
++query that asks (`getRequiredChatsWithStatus`, `getMissingRequiredChats`,
++`tryClaimVerification`, `tryRevokeVerification`), and a test fails if any of
++them stops using it. The old `active` column is kept only as a deprecated mirror
++of `status <> 'ended'` so a rollback still behaves; nothing reads it.
++
++Each state change carries Telegram's event timestamp and is applied only if it
++is not older than the last one, so a redelivered or out-of-order update can
++neither resurrect an ended request nor end a newer one.
++
++**People who were already in a chat.** On `/start`, when a contact is shared and
++when **Verify** is pressed, the bot asks Telegram (`getChatMember`) about each
++required chat the database says is *not* satisfied and records the ones the user
++is really in. Chats already satisfied cost no API call. A failed lookup is
++logged and counts as "not satisfied" — never as a pass — and a reply of `left`
++changes nothing, because Telegram gives the same answer for someone with a
++pending request and someone who never asked.
++
++### Upgrading to manual approval (order matters)
++
++This repo auto-deploys, so do these before merging:
++
++1. **Migrate the database.** Adds `status` and `event_at` to `join_requests` and
++   backfills them from `active` (active → `member`, inactive → `ended`). Nothing
++   is deleted and no user, count or verification row is touched, so the code
++   that is running keeps working.
++   ```bash
++   npx wrangler d1 execute referral_bot_db --remote --file=./migrations/0006_join_request_status.sql
++   ```
++   Run it **once** — a second run fails on the duplicate column.
++2. **Re-register the webhook** with the `curl` under *Upgrading*, step 2. It now
++   lists `chat_member` and `callback_query`. Confirm with
++   `curl "https://api.telegram.org/bot<BOT_TOKEN>/getWebhookInfo"` and check the
++   returned list of allowed update types.
++3. **Make sure the bot is an administrator** of every required chat with
++   *Invite Users via Link*. Without admin rights Telegram sends no `chat_member`
++   updates, even when the webhook asks for them.
++4. **Deploy.** From then on requests wait for a human: an admin has to open each
++   chat's join-request list and approve.
++
++### Pending requests and declines — what the bot cannot know
++
++Telegram sends a bot **no update when an admin declines a request** or when the
++user withdraws one; the Bot API has no such event. So a `pending` row can only
++end through a `left`/`kicked` membership update or by the user asking again. A
++user whose request an admin later declines therefore stays counted as having
++requested. That is the direct consequence of the rule that a pending request
++satisfies the requirement, not a bug — but it means an admin declining someone
++does **not** claw back their referrer's credit. Whether Telegram emits a
++membership update when someone with only a pending request is banned is not
++documented; do not rely on it.
++
++`chat_member` delivery is also best-effort (Telegram occasionally drops them), so
++nothing here *depends* on it: verification works from pending requests alone, and
++membership is reconciled by lookup when it matters.
++
+ ## How verification works
+ 
+ A user becomes verified only when a single atomic `UPDATE` finds all of:
+ 
+-- they arrived through someone's referral link (`referred_by IS NOT NULL`)
+ - they shared their contact, and that phone number is not linked to any other
+   account
+-- they have a join request recorded for **every currently active** required chat
++- for **every currently active** required chat they have a **pending join
++  request or are an actual member** — admin approval is not required
++
++If they arrived through someone's referral link, that referrer's verified count
++goes up by one at the same moment; a user who found the bot directly can verify
++too and simply credits nobody. The referral code and `/start <code>` deep link
++are unchanged.
+ 
+ Every condition is evaluated inside that one statement (`tryClaimVerification`
+ in `src/db.ts`), so there is no read-then-write window for a concurrent webhook
+@@ -195,16 +286,26 @@ npx wrangler d1 export referral_bot_db --remote --output=backup.sql
+ ## Testing
+ 
+ ```bash
+-npm test          # 36 assertions against real SQLite, offline
++npm test          # everything below, offline, no Telegram or Cloudflare account
+ npm run typecheck
+ ```
+ 
+-`tests/sql.test.mjs` runs the atomic statements from `src/db.ts` against
+-in-memory SQLite, covering rotation, grandfathering, the empty-list guard,
+-webhook-retry double-claims, phone reuse, and threshold overshoot.
+-`tests/migration.test.mjs` applies the migration to a populated v1 database and
+-checks nothing is lost. Both assert the SQL still matches `src/db.ts`, so they
+-fail if the source drifts.
++- `tests/sql.test.mjs` runs the atomic statements from `src/db.ts` against
++  in-memory SQLite: rotation, grandfathering, the empty-list guard, webhook-retry
++  double-claims, phone reuse, threshold overshoot, and the pending / member /
++  ended state machine including duplicate and out-of-order updates.
++- `tests/join-flow.test.mjs` drives the **real handlers** end to end with a fake
++  Telegram: `/start` → contact → join request → Verify → referral credit,
++  covering no auto-approval, pending requests satisfying and crediting once,
++  idempotency, already-members, and users with neither.
++- `tests/webhook.test.mjs` asserts nothing in `src/` approves join requests and
++  that the README's webhook registration matches the update types `src/bot.ts`
++  handles.
++- `tests/migration.test.mjs` applies every migration to a populated v1 database
++  and checks nothing is lost and a migrated database matches a fresh install.
++
++The SQL tests assert the statements still match `src/db.ts`, so they fail if the
++source drifts.
+ 
+ ## Not built
+ 
+diff --git a/migrations/0006_join_request_status.sql b/migrations/0006_join_request_status.sql
+new file mode 100644
+index 0000000..c1028fa
+--- /dev/null
++++ b/migrations/0006_join_request_status.sql
+@@ -0,0 +1,39 @@
++-- Migration: separate "sent a join request" from "is actually a member".
++--
++-- Until now join_requests.active meant both. That was tolerable while the bot
++-- approved every request itself (a request became a membership within the same
++-- webhook), but requests are now approved manually by a Telegram admin, so the
++-- two facts diverge: a user can hold a PENDING request without being in the
++-- chat. Both satisfy the bot's requirement; they are not the same thing.
++--
++--   status = 'pending'  request sent, no admin decision yet   (satisfies)
++--   status = 'member'   actually in the chat                  (satisfies)
++--   status = 'ended'    left / removed / request withdrawn    (does not)
++--
++-- Apply ONCE, before deploying the matching code:
++--   npx wrangler d1 execute referral_bot_db --remote --file=./migrations/0006_join_request_status.sql
++--
++-- Nothing is deleted and no user, referral or verification row is touched.
++
++-- 'pending' is only the column default for rows written by an older build
++-- during the deploy window; the UPDATE below assigns every existing row.
++ALTER TABLE join_requests ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'
++  CHECK (status IN ('pending', 'member', 'ended'));
++
++-- Telegram time of the event that last set `status`; 0 = "before we tracked it".
++-- Any real event is newer, so the first live update always wins over old data.
++ALTER TABLE join_requests ADD COLUMN event_at INTEGER NOT NULL DEFAULT 0;
++
++-- Backfill from the old meaning. `active` was documented as "1 while the user
++-- is in the chat, 0 once they leave", and the old code approved every request
++-- the moment it arrived -- so an active row was a live membership and an
++-- inactive one is a departure. Either way, rows that counted before still
++-- count and rows that did not still do not, so no verification changes.
++UPDATE join_requests
++SET status = CASE WHEN active = 1 THEN 'member' ELSE 'ended' END;
++
++-- `active` is left in place as a deprecated mirror (status <> 'ended') rather
++-- than dropped: dropping is irreversible and would break a rollback.
++
++CREATE INDEX IF NOT EXISTS idx_join_requests_status
++  ON join_requests(telegram_user_id, status);
+diff --git a/package.json b/package.json
+index e77f21b..b931da5 100644
+--- a/package.json
++++ b/package.json
+@@ -9,7 +9,7 @@
+     "typecheck": "tsc --noEmit",
+     "db:init": "wrangler d1 execute referral_bot_db --file=./schema.sql",
+     "db:init:remote": "wrangler d1 execute referral_bot_db --remote --file=./schema.sql",
+-    "test": "node tests/sql.test.mjs && node tests/migration.test.mjs && node tests/config.test.mjs && node tests/phone.test.mjs && node tests/rewards.test.mjs && node tests/cache.test.mjs",
++    "test": "node tests/sql.test.mjs && node tests/migration.test.mjs && node tests/config.test.mjs && node tests/phone.test.mjs && node tests/rewards.test.mjs && node tests/cache.test.mjs && node tests/webhook.test.mjs && node tests/join-flow.test.mjs",
+     "test:sql": "node tests/sql.test.mjs",
+     "test:migration": "node tests/migration.test.mjs",
+     "db:migrate": "wrangler d1 execute referral_bot_db --file=./migrations/0002_dynamic_requirements.sql",
+@@ -17,7 +17,9 @@
+     "test:config": "node tests/config.test.mjs",
+     "test:phone": "node tests/phone.test.mjs",
+     "test:rewards": "node tests/rewards.test.mjs",
+-    "test:cache": "node tests/cache.test.mjs"
++    "test:cache": "node tests/cache.test.mjs",
++    "test:webhook": "node tests/webhook.test.mjs",
++    "test:flow": "node tests/join-flow.test.mjs"
+   },
+   "dependencies": {
+     "grammy": "^1.30.0"
+diff --git a/schema.sql b/schema.sql
+index 33e37d4..63f28f5 100644
+--- a/schema.sql
++++ b/schema.sql
+@@ -70,19 +70,41 @@ CREATE TABLE IF NOT EXISTS required_chats (
+ 
+ CREATE INDEX IF NOT EXISTS idx_required_chats_active ON required_chats(active);
+ 
+--- One row per (user, chat) join request, and the single source of truth for
+--- "did this Telegram user ID request to join this chat".
++-- One row per (user, chat), and the single source of truth for where a Telegram
++-- user ID stands with a required chat.
+ --
+--- Independent of whether the user has registered with the bot yet, so a join
+--- request that arrives before /start is never lost. The composite primary key
++-- Independent of whether the user has registered with the bot yet, so a state
++-- change that arrives before /start is never lost. The composite primary key
+ -- makes duplicate Telegram webhook deliveries (retries) idempotent.
++--
++-- `status` keeps two different facts apart that a single boolean used to blur:
++--
++--   pending  the user sent a join request that no admin has decided yet.
++--            Set by chat_join_request. SATISFIES the requirement.
++--   member   the user is actually in the chat. Set by chat_member, or by a
++--            getChatMember lookup. SATISFIES the requirement.
++--   ended    the user left, was removed, or their request was withdrawn.
++--            Does NOT satisfy the requirement.
++--
++-- "Requirement satisfied" is therefore exactly:  status IN ('pending','member').
++-- A requirement with no row at all is not satisfied either.
++--
++-- Telegram tells a bot nothing when an admin DECLINES a request, so a pending
++-- row cannot be ended by a decline -- only by a later left/kicked event or by
++-- the user requesting again. See README "Pending requests and declines".
+ CREATE TABLE IF NOT EXISTS join_requests (
+   telegram_user_id INTEGER NOT NULL,
+   chat_id          INTEGER NOT NULL,
+   requested_at     TEXT NOT NULL DEFAULT (datetime('now')),
+-  -- 1 while the user is in the chat, 0 once they leave or are removed. Only
+-  -- live memberships satisfy a requirement, so a member who joins and then
+-  -- leaves stops counting for their referrer.
++  status           TEXT NOT NULL DEFAULT 'pending'
++                   CHECK (status IN ('pending', 'member', 'ended')),
++  -- Unix time (seconds) of the Telegram event that last set `status`. A state
++  -- change is applied only if it is not older than this, so a redelivered or
++  -- out-of-order update can neither resurrect an ended request nor end a newer
++  -- one. 0 for rows that predate the column.
++  event_at         INTEGER NOT NULL DEFAULT 0,
++  -- DEPRECATED. Mirrors (status <> 'ended') so that rolling back to a build
++  -- that still reads it behaves sensibly. The application never reads it.
+   active           INTEGER NOT NULL DEFAULT 1,
+   PRIMARY KEY (telegram_user_id, chat_id)
+ );
+@@ -90,4 +112,7 @@ CREATE TABLE IF NOT EXISTS join_requests (
+ CREATE INDEX IF NOT EXISTS idx_join_requests_active
+   ON join_requests(telegram_user_id, active);
+ 
++CREATE INDEX IF NOT EXISTS idx_join_requests_status
++  ON join_requests(telegram_user_id, status);
++
+ CREATE INDEX IF NOT EXISTS idx_join_requests_chat ON join_requests(chat_id);
+diff --git a/src/bot.ts b/src/bot.ts
+index 78e4b54..0346101 100644
+--- a/src/bot.ts
++++ b/src/bot.ts
+@@ -19,14 +19,15 @@ import {
+   invalidateRequiredChatCache,
+   isRequiredChatCached,
+   listRequiredChats,
++  markJoinEnded,
++  markJoinMember,
+   recordJoinRequest,
+   setContactShared,
+-  setJoinRequestActive,
+   setRequiredChatInviteLink,
+   type RequiredChatRow,
+   type UserRow,
+ } from "./db";
+-import { tryVerifyAndQualify } from "./verification";
++import { membershipOf, tryVerifyAndQualify } from "./verification";
+ import { isAdmin } from "./admin";
+ import {
+   handlePreCheckout,
+@@ -109,7 +110,7 @@ async function stepsMessage(env: Env, user: UserRow, prefix = ""): Promise<{ tex
+   // One query returns every active chat and whether this user is in it; the
+   // caller needs both, and both come from the same rows.
+   const chats = await getRequiredChatsWithStatus(env.DB, user.telegram_user_id);
+-  const missing = chats.filter((c) => !c.joined);
++  const missing = chats.filter((c) => !c.satisfied);
+   const needsContact = !user.contact_shared;
+ 
+   const lines = [
+@@ -121,7 +122,7 @@ async function stepsMessage(env: Env, user: UserRow, prefix = ""): Promise<{ tex
+       `${missing.length === 0 ? "✅ done" : `⬜ ${chats.length - missing.length}/${chats.length} done`}`,
+     "3️⃣ Tap “✅ Verify me” when both are complete",
+     "",
+-    "Join requests are approved automatically once you have shared your contact.",
++    "An admin reviews each join request. You do not need to wait for that — tap “✅ Verify me” as soon as you have sent them.",
+     "",
+     `Your referral link:\nhttps://t.me/${env.BOT_USERNAME}?start=${user.referral_code}`,
+   ];
+@@ -184,7 +185,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
+       from.username ?? null,
+       from.first_name ?? null
+     );
+-    await tryVerifyAndQualify(env, bot.api, from.id);
++    await tryVerifyAndQualify(env, bot.api, from.id, { reconcile: true });
+ 
+     const fresh = (await getUserById(env.DB, from.id)) ?? user;
+ 
+@@ -284,7 +285,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
+       return;
+     }
+ 
+-    await tryVerifyAndQualify(env, bot.api, from.id);
++    await tryVerifyAndQualify(env, bot.api, from.id, { reconcile: true });
+     const fresh = await getUserById(env.DB, from.id);
+     if (fresh?.verified) {
+       await ctx.reply("✅ Contact received — you are now fully verified!", { reply_markup: { remove_keyboard: true } });
+@@ -319,7 +320,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
+         return;
+       }
+       case "verify": {
+-        await tryVerifyAndQualify(env, bot.api, from.id);
++        await tryVerifyAndQualify(env, bot.api, from.id, { reconcile: true });
+         const fresh = await getUserById(env.DB, from.id);
+         if (fresh?.verified) {
+           await ctx.answerCallbackQuery({ text: "✅ Verified!", show_alert: false });
+@@ -393,7 +394,12 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
+     }
+   });
+ 
+-  // ---- Join requests: only people who came through the bot get in ----
++  // ---- Join requests: recorded here, approved by a human ----
++  //
++  // The bot NEVER approves a join request. A Telegram admin approves or rejects
++  // each one. Sending the request is what satisfies this bot's requirement -- a
++  // pending request counts -- so the user can verify (and their referrer is
++  // credited) without waiting for that decision.
+ 
+   bot.on("chat_join_request", async (ctx) => {
+     const req = ctx.chatJoinRequest;
+@@ -402,7 +408,9 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
+     const user = await getUserById(env.DB, req.from.id);
+ 
+     // Anyone who did not onboard through the bot is turned away, which is what
+-    // makes the bot the only route into these chats even if a link leaks.
++    // makes the bot the only route into these chats even if a link leaks. This
++    // is the one automatic decision the bot still takes, and it is a refusal:
++    // nothing here approves anyone.
+     if (!user || !user.contact_shared) {
+       try {
+         await bot.api.declineChatJoinRequest(req.chat.id, req.from.id);
+@@ -413,39 +421,44 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
+         .sendMessage(
+           req.from.id,
+           `To join, start @${env.BOT_USERNAME} first and share your contact. ` +
+-            "Your request was not approved because it did not come through the bot."
++            "Your request was declined because it did not come through the bot."
+         )
+         .catch(() => {});
+       return;
+     }
+ 
+-    await recordJoinRequest(env.DB, req.from.id, req.chat.id);
+-    try {
+-      await bot.api.approveChatJoinRequest(req.chat.id, req.from.id);
+-    } catch (err) {
+-      console.error(`Failed to approve join request from ${req.from.id}:`, err);
+-    }
++    await recordJoinRequest(env.DB, req.from.id, req.chat.id, req.date);
++    // Runs even when the row was already recorded: if an earlier delivery wrote
++    // it and then failed before verifying, Telegram's retry must still finish
++    // the job. Verification is single-shot, so re-running it is harmless.
+     await tryVerifyAndQualify(env, bot.api, req.from.id);
+   });
+ 
+-  // ---- Membership changes: only people who STAY are counted ----
++  // ---- Membership changes: keeps "actual member" in step with Telegram ----
++  //
++  // Needs "chat_member" in the webhook's allowed_updates AND the bot to be an
++  // admin of the chat, or Telegram never sends these. This is for TRACKING
++  // membership (an approval, a departure); verification does not wait for it.
+ 
+   bot.on("chat_member", async (ctx) => {
+     const upd = ctx.chatMember;
+     if (!(await isRequiredChatCached(env.DB, upd.chat.id))) return;
+ 
+-    const status = upd.new_chat_member.status;
+-    const present = status === "member" || status === "administrator" || status === "creator";
+-    const gone = status === "left" || status === "kicked";
+-    if (!present && !gone) return; // "restricted" etc. leave the state as-is
++    const userId = upd.new_chat_member.user.id;
++    const presence = membershipOf(upd.new_chat_member);
++    if (presence === "unknown") return; // leave the stored state as-is
+ 
+-    const changed = await setJoinRequestActive(env.DB, upd.new_chat_member.user.id, upd.chat.id, present);
++    const changed =
++      presence === "present"
++        ? await markJoinMember(env.DB, userId, upd.chat.id, upd.date)
++        : await markJoinEnded(env.DB, userId, upd.chat.id, upd.date);
+     if (!changed) return;
+ 
+     // Re-evaluates in whichever direction the new state calls for: a departure
+     // revokes verification and takes the referrer's credit back, a rejoin
+-    // restores both.
+-    await tryVerifyAndQualify(env, bot.api, upd.new_chat_member.user.id);
++    // restores both. Approving a pending request only turns 'pending' into
++    // 'member' -- both satisfy -- so it changes nothing the referrer sees.
++    await tryVerifyAndQualify(env, bot.api, userId);
+   });
+ 
+   // ---- Telegram Stars payments ----
+diff --git a/src/db.ts b/src/db.ts
+index 379e632..bd54163 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -223,14 +223,22 @@ export async function isRequiredChat(db: D1Database, chatId: number): Promise<bo
+ }
+ 
+ export interface RequiredChatStatus extends RequiredChatRow {
+-  /** 1 when the user currently holds a live membership in this chat. */
+-  joined: number;
++  /**
++   * 1 when this chat's requirement is met for the user: they hold a pending
++   * join request OR are an actual member. See join_requests.status in schema.sql.
++   */
++  satisfied: number;
+ }
+ 
+ /**
+- * Every active required chat plus whether this user is in it, in one query.
+- * Replaces the pair of calls that previously fetched the list and the missing
+- * subset separately -- the caller needs both, and both came from the same rows.
++ * Every active required chat plus whether this user has satisfied it, in one
++ * query. Replaces the pair of calls that previously fetched the list and the
++ * missing subset separately -- the caller needs both, and both came from the
++ * same rows.
++ *
++ * "Satisfied" is `status IN ('pending', 'member')` and is written out
++ * identically in every statement below that asks the question. There is
++ * deliberately one definition, so no path can disagree about it.
+  */
+ export async function getRequiredChatsWithStatus(
+   db: D1Database,
+@@ -241,8 +249,8 @@ export async function getRequiredChatsWithStatus(
+       `SELECT rc.*,
+               EXISTS (
+                 SELECT 1 FROM join_requests jr
+-                WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
+-              ) AS joined
++                WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
++              ) AS satisfied
+        FROM required_chats rc
+        WHERE rc.active = 1
+        ORDER BY rc.added_at ASC`
+@@ -252,7 +260,7 @@ export async function getRequiredChatsWithStatus(
+   return res.results ?? [];
+ }
+ 
+-/** The active required chats this user has not yet sent a join request to. */
++/** The active required chats this user has neither requested to join nor joined. */
+ export async function getMissingRequiredChats(db: D1Database, userId: number): Promise<RequiredChatRow[]> {
+   const res = await db
+     .prepare(
+@@ -260,7 +268,7 @@ export async function getMissingRequiredChats(db: D1Database, userId: number): P
+        WHERE rc.active = 1
+          AND NOT EXISTS (
+                SELECT 1 FROM join_requests jr
+-               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
++               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
+              )
+        ORDER BY rc.added_at ASC`
+     )
+@@ -269,23 +277,99 @@ export async function getMissingRequiredChats(db: D1Database, userId: number): P
+   return res.results ?? [];
+ }
+ 
+-// ---- Join requests ----
++// ---- Join requests and membership ----
++//
++// Three transitions over join_requests.status (see schema.sql):
++//
++//   chat_join_request  ->  pending   recordJoinRequest
++//   chat_member in     ->  member    markJoinMember   (also getChatMember)
++//   chat_member out    ->  ended     markJoinEnded
++//
++// Each takes the Telegram timestamp of the event and applies only if the row has
++// not already moved past it. Telegram may redeliver an update after a retry, and
++// documents update_id as the way to "restore the correct update sequence, should
++// they get out of order" -- an unguarded write would let a stale duplicate
++// resurrect a request that has ended, or end one the user has since re-sent.
++//
++// Each returns true only when the row actually changed, so a duplicate delivery
++// is a cheap no-op and the caller can skip re-evaluating verification.
++//
++// `active` is written alongside as a deprecated mirror (status <> 'ended'); no
++// code in this repository reads it.
+ 
+ /**
+  * Records that this Telegram user ID sent a join request to this chat ID.
+- * Idempotent: Telegram may redeliver the same webhook update on retry, and the
+- * (telegram_user_id, chat_id) primary key makes a duplicate a no-op. Rows are
+- * written regardless of whether the user has registered with the bot yet, so a
+- * join request sent before /start is never lost.
++ * Written regardless of whether the user has registered with the bot yet. The
++ * request is PENDING until an admin decides it -- the bot never approves it --
++ * and a pending request satisfies the requirement.
++ *
++ * Strictly newer than the stored event: a duplicate of the same request (same
++ * timestamp) changes nothing, so it can never demote a row that has since
++ * become 'member'.
+  */
+-export async function recordJoinRequest(db: D1Database, userId: number, chatId: number): Promise<void> {
+-  await db
++export async function recordJoinRequest(
++  db: D1Database,
++  userId: number,
++  chatId: number,
++  eventAt: number
++): Promise<boolean> {
++  const res = await db
+     .prepare(
+-      `INSERT INTO join_requests (telegram_user_id, chat_id, active) VALUES (?, ?, 1)
+-       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE SET active = 1`
++      `INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at, active)
++       VALUES (?, ?, 'pending', ?, 1)
++       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE
++         SET status = 'pending', event_at = excluded.event_at, active = 1
++         WHERE excluded.event_at > join_requests.event_at`
+     )
+-    .bind(userId, chatId)
++    .bind(userId, chatId, eventAt)
+     .run();
++  return (res.meta.changes ?? 0) > 0;
++}
++
++/**
++ * Records that the user is actually in the chat: an admin approved their
++ * request, they joined some other way, or a getChatMember lookup found them
++ * there. Creates the row when there is none, so a member is recognised even if
++ * they never went through this bot's join-request flow.
++ */
++export async function markJoinMember(
++  db: D1Database,
++  userId: number,
++  chatId: number,
++  eventAt: number
++): Promise<boolean> {
++  const res = await db
++    .prepare(
++      `INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at, active)
++       VALUES (?, ?, 'member', ?, 1)
++       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE
++         SET status = 'member', event_at = excluded.event_at, active = 1
++         WHERE excluded.event_at >= join_requests.event_at AND join_requests.status <> 'member'`
++    )
++    .bind(userId, chatId, eventAt)
++    .run();
++  return (res.meta.changes ?? 0) > 0;
++}
++
++/**
++ * Records that the user left, was removed, or is otherwise no longer requested
++ * or a member. Never creates a row: a departure from a chat this user never
++ * touched is nothing to remember.
++ */
++export async function markJoinEnded(
++  db: D1Database,
++  userId: number,
++  chatId: number,
++  eventAt: number
++): Promise<boolean> {
++  const res = await db
++    .prepare(
++      `UPDATE join_requests SET status = 'ended', event_at = ?, active = 0
++       WHERE telegram_user_id = ? AND chat_id = ? AND status <> 'ended' AND ? >= event_at`
++    )
++    .bind(eventAt, userId, chatId, eventAt)
++    .run();
++  return (res.meta.changes ?? 0) > 0;
+ }
+ 
+ // ---- Verification ----
+@@ -294,6 +378,10 @@ export async function recordJoinRequest(db: D1Database, userId: number, chatId:
+  * Atomically checks every verification condition against the *current* active
+  * required-chat set and flips verified 0->1 in a single statement.
+  *
++ * "Every required chat satisfied" means a pending join request OR actual
++ * membership -- NOT admin approval. A user is verified, and their referrer is
++ * credited, before any admin has looked at their request.
++ *
+  * A referrer is NOT required: an organic user who finds the bot directly can
+  * verify on their own. Referrals only matter for reaching the premium
+  * threshold, which is counted on the referrer's side.
+@@ -326,7 +414,7 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
+                WHERE rc.active = 1
+                  AND NOT EXISTS (
+                        SELECT 1 FROM join_requests jr
+-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
++                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
+                      )
+              )
+        RETURNING referred_by`
+@@ -336,24 +424,10 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
+   return { changed: row !== null, referredBy: row?.referred_by ?? null };
+ }
+ 
+-/** Marks a membership live or lost. Returns true if the state actually changed. */
+-export async function setJoinRequestActive(
+-  db: D1Database,
+-  userId: number,
+-  chatId: number,
+-  active: boolean
+-): Promise<boolean> {
+-  const res = await db
+-    .prepare("UPDATE join_requests SET active = ? WHERE telegram_user_id = ? AND chat_id = ? AND active <> ?")
+-    .bind(active ? 1 : 0, userId, chatId, active ? 1 : 0)
+-    .run();
+-  return (res.meta.changes ?? 0) > 0;
+-}
+-
+ /**
+  * The mirror image of tryClaimVerification: drops verified 1->0 in one
+- * statement when the user no longer holds a live membership in every active
+- * required chat. Returns true only for the call that performed the
++ * statement when the user no longer satisfies every active required chat (no
++ * pending request and no membership). Returns true only for the call that performed the
+  * transition, so exactly one caller decrements the referrer -- the same
+  * discipline that stops the increment double-counting.
+  */
+@@ -369,7 +443,7 @@ export async function tryRevokeVerification(db: D1Database, userId: number): Pro
+                WHERE rc.active = 1
+                  AND NOT EXISTS (
+                        SELECT 1 FROM join_requests jr
+-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
++                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
+                      )
+              )
+        RETURNING referred_by`
+diff --git a/src/verification.ts b/src/verification.ts
+index cbfa799..92bbdfd 100644
+--- a/src/verification.ts
++++ b/src/verification.ts
+@@ -3,35 +3,115 @@ import type { Env } from "./types";
+ import { qualifyThreshold, referralRewardInr } from "./types";
+ import {
+   decrementVerifiedReferralCount,
++  getMissingRequiredChats,
+   getUserById,
+   incrementVerifiedReferralCount,
++  markJoinMember,
+   tryClaimQualification,
+   tryClaimVerification,
+   tryRevokeVerification,
+ } from "./db";
+ import { notifyAdmins, sendPremiumInvoice } from "./payments";
+ 
++/**
++ * What a Telegram chat-member status says about being in the chat right now.
++ *
++ *   present  in the chat
++ *   gone     not in the chat (left, or removed/banned)
++ *   unknown  says nothing reliable -- a restricted user who is not a member may
++ *            or may not have a pending request, so the stored state is kept
++ *
++ * Takes the structural bits of a ChatMember so it serves both a chat_member
++ * update and a getChatMember reply.
++ */
++export function membershipOf(m: { status: string; is_member?: boolean }): "present" | "gone" | "unknown" {
++  switch (m.status) {
++    case "creator":
++    case "administrator":
++    case "member":
++      return "present";
++    case "restricted":
++      return m.is_member ? "present" : "unknown";
++    case "left":
++    case "kicked":
++      return "gone";
++    default:
++      return "unknown";
++  }
++}
++
++/**
++ * Asks Telegram whether the user is already IN each required chat the database
++ * says they have not satisfied, and records the ones they are.
++ *
++ * This is what makes someone who was a member before the bot began tracking
++ * them (or whose chat_member update was never delivered) count, instead of
++ * being told to join a chat they are already in. Two properties keep it safe:
++ *
++ *  - It only ever ADDS membership. A "left" reply is ambiguous -- Telegram gives
++ *    the same status to a user with a pending request and to one who never
++ *    asked -- so it changes nothing, and an existing pending row is kept.
++ *  - A failed lookup (bot not admin, chat unreachable, Telegram down) proves
++ *    nothing, so it is logged and treated as "not satisfied", never as a pass.
++ *
++ * Chats already satisfied cost no API call, so a user with nothing missing
++ * costs nothing. It is not run from the chat_member / chat_join_request
++ * handlers, which fire for every membership change and already carry exact
++ * state.
++ */
++export async function reconcileMembership(env: Env, api: Api, userId: number): Promise<void> {
++  const missing = await getMissingRequiredChats(env.DB, userId);
++  if (missing.length === 0) return;
++
++  await Promise.all(
++    missing.map(async (chat) => {
++      // Stamped from before the question is asked: the answer can be no newer
++      // than that, so a departure Telegram reports after this moment still wins.
++      const observedAt = Math.floor(Date.now() / 1000);
++      try {
++        const member = await api.getChatMember(chat.chat_id, userId);
++        if (membershipOf(member) === "present") {
++          await markJoinMember(env.DB, userId, chat.chat_id, observedAt);
++        }
++      } catch (err) {
++        console.error(`getChatMember failed for user ${userId} in chat ${chat.chat_id}:`, err);
++      }
++    })
++  );
++}
++
+ /**
+  * Call this after any event that could change whether a user meets every
+- * requirement: contact shared, a referrer set, a join request approved, or a
+- * membership lost. It moves verification in whichever direction the current
+- * state calls for, and is a no-op unless this specific call is the one that
+- * flips it.
++ * requirement: contact shared, a join request sent, membership gained or lost.
++ * It moves verification in whichever direction the current state calls for, and
++ * is a no-op unless this specific call is the one that flips it.
++ *
++ * `reconcile` additionally checks Telegram for chats the database thinks are
++ * unsatisfied. Pass it from paths the user drives themselves (/start, sharing a
++ * contact, tapping Verify); leave it off for webhook-driven paths.
+  *
+  * Qualification is deliberately NOT revoked when a count falls back below the
+  * threshold: premium access, once paid for, stays paid for. The rupee figure
+  * is derived from the live count instead, so it falls on its own.
+  */
+-export async function tryVerifyAndQualify(env: Env, api: Api, userId: number): Promise<void> {
++export async function tryVerifyAndQualify(
++  env: Env,
++  api: Api,
++  userId: number,
++  opts: { reconcile?: boolean } = {}
++): Promise<void> {
++  if (opts.reconcile) await reconcileMembership(env, api, userId);
++
+   const claim = await tryClaimVerification(env.DB, userId);
+   if (claim.changed) {
+     await creditReferrer(env, api, claim.referredBy, +1);
+     return;
+   }
+ 
+-  // Not newly verified. They may instead have just stopped qualifying -- a
+-  // membership they had is gone. Revoking is the exact mirror of claiming and
+-  // is equally single-shot, so only one caller ever takes the credit back.
++  // Not newly verified. They may instead have just stopped qualifying -- they
++  // no longer have a pending request or membership somewhere. Revoking is the
++  // exact mirror of claiming and is equally single-shot, so only one caller
++  // ever takes the credit back.
+   const revoke = await tryRevokeVerification(env.DB, userId);
+   if (revoke.changed) await creditReferrer(env, api, revoke.referredBy, -1);
+ }
+diff --git a/tests/join-flow.test.mjs b/tests/join-flow.test.mjs
+new file mode 100644
+index 0000000..26c20a6
+--- /dev/null
++++ b/tests/join-flow.test.mjs
+@@ -0,0 +1,648 @@
++// End-to-end behaviour of the join-request / verification / referral flow.
++//
++// Unlike sql.test.mjs (which runs copies of the SQL), this drives the REAL
++// compiled handlers in src/bot.ts: updates go in through bot.handleUpdate, the
++// database is real SQLite behind a D1-shaped wrapper, and Telegram is a fake
++// that records every API call the bot makes and answers getChatMember from a
++// script. Nothing about the bot is mocked -- only its two edges.
++//
++// Business rules under test:
++//   * join requests are approved MANUALLY by an admin; the bot never approves
++//   * a pending request satisfies the requirement, exactly like real membership
++//   * verification (and the referrer's credit) does not wait for admin approval
++//   * already-members are recognised; people with neither are not
++//
++// Run with: npm run test:flow
++
++import { DatabaseSync } from "node:sqlite";
++import { mkdtempSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
++import { execFileSync } from "node:child_process";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import assert from "node:assert/strict";
++
++// ---- compile the real source ------------------------------------------------
++
++const root = new URL("..", import.meta.url).pathname;
++const out = mkdtempSync(join(tmpdir(), "flow-"));
++execFileSync("npx", ["tsc", "-p", "tsconfig.json", "--noEmit", "false", "--outDir", out], {
++  cwd: root,
++  stdio: "pipe",
++});
++// tsc keeps extensionless relative imports (the project targets a bundler);
++// Node's ESM loader needs them, so add the extension in the emitted copy.
++for (const f of readdirSync(out).filter((n) => n.endsWith(".js"))) {
++  const file = join(out, f);
++  writeFileSync(file, readFileSync(file, "utf8").replace(/from "(\.\/[^"]+)"/g, 'from "$1.js"'));
++}
++writeFileSync(join(out, "package.json"), '{"type":"module"}');
++symlinkSync(join(root, "node_modules"), join(out, "node_modules")); // for `grammy`
++
++const { createBot } = await import(join(out, "bot.js"));
++const dbmod = await import(join(out, "db.js"));
++const schema = readFileSync(new URL("../schema.sql", import.meta.url), "utf8");
++
++// ---- one clock for the whole test ------------------------------------------
++//
++// Telegram stamps every event with its own time, and the bot stamps a
++// getChatMember observation with Date.now(). In production those agree; here
++// both follow this counter so each step is unambiguously later than the last.
++let clock = 1_800_000_000;
++const tick = () => ++clock;
++Date.now = () => clock * 1000;
++
++// ---- a D1-shaped wrapper over node:sqlite -----------------------------------
++
++function d1(sqlite) {
++  return {
++    prepare(sql) {
++      const st = sqlite.prepare(sql);
++      let params = [];
++      const q = {
++        bind(...a) {
++          params = a;
++          return q;
++        },
++        async first() {
++          return st.get(...params) ?? null;
++        },
++        async all() {
++          return { results: st.all(...params) };
++        },
++        async run() {
++          const r = st.run(...params);
++          return { meta: { changes: Number(r.changes) } };
++        },
++      };
++      return q;
++    },
++  };
++}
++
++// ---- the world: bot + database + scripted Telegram --------------------------
++
++const BOT_INFO = {
++  id: 424242,
++  is_bot: true,
++  first_name: "Test",
++  username: "Testbot",
++  can_join_groups: true,
++  can_read_all_group_messages: false,
++  supports_inline_queries: false,
++  can_connect_to_business: false,
++  has_main_web_app: false,
++};
++
++function makeWorld({ chats = [-101, -102] } = {}) {
++  const sqlite = new DatabaseSync(":memory:");
++  sqlite.exec(schema);
++  for (const id of chats) {
++    sqlite
++      .prepare("INSERT INTO required_chats (chat_id, title, kind, invite_link) VALUES (?, ?, 'group', ?)")
++      .run(id, `Chat${-id}`, `https://t.me/+link${-id}`);
++  }
++  dbmod.invalidateRequiredChatCache();
++
++  const env = {
++    DB: d1(sqlite),
++    BOT_TOKEN: "1:test",
++    WEBHOOK_SECRET: "s",
++    ADMIN_EXPORT_TOKEN: "t",
++    BOT_USERNAME: "Testbot",
++    PREMIUM_GROUP_CHAT_ID: "-999",
++    ADMIN_IDS: "999",
++    QUALIFY_THRESHOLD: "200",
++    PREMIUM_PRICE_STARS: "1500",
++    REFERRAL_REWARD_INR: "10",
++  };
++
++  const w = {
++    sqlite,
++    env,
++    calls: [],
++    /** "<chat>:<user>" -> Telegram status returned by getChatMember (default "left"). */
++    members: {},
++    /** When true, getChatMember throws, like a Telegram outage or a bot without rights. */
++    lookupsFail: false,
++  };
++
++  const bot = createBot(env, BOT_INFO);
++  bot.api.config.use(async (_prev, method, payload) => {
++    w.calls.push({ method, payload });
++    if (method === "getChatMember") {
++      if (w.lookupsFail) throw new Error("Bad Request: chat not found");
++      const status = w.members[`${payload.chat_id}:${payload.user_id}`] ?? "left";
++      const user = { id: payload.user_id, is_bot: false, first_name: `User${payload.user_id}` };
++      return { ok: true, result: status === "restricted" ? { status, user, is_member: true } : { status, user } };
++    }
++    if (method === "sendMessage") {
++      return { ok: true, result: { message_id: 1, date: 0, chat: { id: payload.chat_id, type: "private" } } };
++    }
++    return { ok: true, result: true };
++  });
++
++  let updateId = 1;
++  const person = (id) => ({ id, is_bot: false, first_name: `User${id}` });
++  const dm = (id) => ({ id, type: "private", first_name: `User${id}` });
++  const send = (update) => bot.handleUpdate({ update_id: updateId++, ...update });
++
++  Object.assign(w, {
++    tick,
++    start: (uid, payload) =>
++      send({
++        message: {
++          message_id: updateId,
++          date: tick(),
++          chat: dm(uid),
++          from: person(uid),
++          text: payload ? `/start ${payload}` : "/start",
++          entities: [{ type: "bot_command", offset: 0, length: 6 }],
++        },
++      }),
++    contact: (uid) =>
++      send({
++        message: {
++          message_id: updateId,
++          date: tick(),
++          chat: dm(uid),
++          from: person(uid),
++          contact: { phone_number: `+91900000${String(uid).padStart(4, "0")}`, first_name: `User${uid}`, user_id: uid },
++        },
++      }),
++    verify: (uid) =>
++      send({
++        callback_query: {
++          id: `cb${updateId}`,
++          from: person(uid),
++          chat_instance: "ci",
++          data: "verify",
++          message: { message_id: 1, date: tick(), chat: dm(uid) },
++        },
++      }),
++    joinRequest: (uid, chatId, date = tick()) =>
++      send({
++        chat_join_request: {
++          chat: { id: chatId, type: "supergroup", title: `Chat${-chatId}` },
++          from: person(uid),
++          user_chat_id: uid,
++          date,
++        },
++      }),
++    chatMember: (uid, chatId, status, date = tick(), extra = {}) =>
++      send({
++        chat_member: {
++          chat: { id: chatId, type: "supergroup", title: `Chat${-chatId}` },
++          from: person(999),
++          date,
++          old_chat_member: { status: "left", user: person(uid) },
++          new_chat_member: { status, user: person(uid), ...extra },
++        },
++      }),
++  });
++
++  const rows = (sql, ...a) => sqlite.prepare(sql).all(...a);
++  Object.assign(w, {
++    user: (id) => rows("SELECT * FROM users WHERE telegram_user_id = ?", id)[0],
++    verified: (id) => w.user(id)?.verified === 1,
++    count: (id) => w.user(id).verified_referral_count,
++    state: (uid, chat) => rows("SELECT status FROM join_requests WHERE telegram_user_id = ? AND chat_id = ?", uid, chat)[0]?.status ?? null,
++    called: (method) => w.calls.filter((c) => c.method === method),
++    /** Text of every message the bot sent to this user, oldest first. */
++    texts: (uid) => w.calls.filter((c) => c.method === "sendMessage" && c.payload.chat_id === uid).map((c) => c.payload.text),
++    lastText: (uid) => w.texts(uid).at(-1) ?? "",
++    satisfied: async (uid) =>
++      Object.fromEntries((await dbmod.getRequiredChatsWithStatus(env.DB, uid)).map((c) => [c.chat_id, c.satisfied])),
++  });
++
++  return w;
++}
++
++/** A referrer (id 1) and a referred user (id 2) who has opened the referral link. */
++async function referredUser(w) {
++  await w.start(1);
++  await w.start(2, w.user(1).referral_code);
++  assert.equal(w.user(2).referred_by, 1, "the existing referral-code deep link must still set referred_by");
++  return { A: 1, B: 2 };
++}
++
++// ---- harness ----------------------------------------------------------------
++
++// The bot logs (rather than throws) when a Telegram lookup fails. The outage
++// tests trigger that on purpose, so collect it instead of printing stack traces.
++const logged = [];
++console.error = (...args) => logged.push(args.map(String).join(" "));
++
++let pass = 0;
++const failures = [];
++async function test(name, fn) {
++  try {
++    await fn();
++    pass++;
++    console.log(`  ✓ ${name}`);
++  } catch (err) {
++    failures.push(name);
++    console.log(`  ✗ ${name}\n      ${err.message}`);
++  }
++}
++
++// =============================================================================
++console.log("\nTest 1 — join requests are NOT auto-approved");
++
++await test("a join request is recorded as pending and approveChatJoinRequest is never called", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  assert.equal(w.state(B, -101), "pending", "the request must be recorded");
++  assert.equal(w.called("approveChatJoinRequest").length, 0, "the bot must leave approval to the admin");
++  assert.equal(w.called("declineChatJoinRequest").length, 0, "and must not reject a legitimate request either");
++});
++
++await test("no approval is issued even for the request that completes verification", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  await w.joinRequest(B, -102);
++  assert.equal(w.verified(B), true, "precondition: this request completed the requirement");
++  assert.equal(w.called("approveChatJoinRequest").length, 0);
++});
++
++await test("the tokens 'approveChatJoinRequest' / 'approve' never go out over the API for any flow", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  await w.chatMember(B, -101, "member");
++  await w.verify(B);
++  await w.start(B);
++  assert.deepEqual(
++    w.calls.filter((c) => /approve/i.test(c.method)).map((c) => c.method),
++    []
++  );
++});
++
++await test("a request from someone who never onboarded is declined and not recorded (existing gate kept)", async () => {
++  const w = makeWorld();
++  await w.joinRequest(555, -101); // never sent /start
++  assert.equal(w.called("declineChatJoinRequest").length, 1);
++  assert.equal(w.called("approveChatJoinRequest").length, 0);
++  assert.equal(w.state(555, -101), null, "an outsider must not gain a satisfied requirement");
++});
++
++await test("a request for a chat that is not required is ignored entirely", async () => {
++  const w = makeWorld();
++  await w.start(2);
++  await w.contact(2);
++  await w.joinRequest(2, -777);
++  assert.equal(w.state(2, -777), null);
++  assert.equal(w.calls.filter((c) => /ChatJoinRequest/.test(c.method)).length, 0);
++});
++
++// =============================================================================
++console.log("\nTest 2 — a pending request satisfies the requirement");
++
++await test("with a pending request on every chat, each chat reports satisfied", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  assert.deepEqual(await w.satisfied(B), { [-101]: 1, [-102]: 0 });
++  await w.joinRequest(B, -102);
++  assert.deepEqual(await w.satisfied(B), { [-101]: 1, [-102]: 1 });
++  assert.equal(w.state(B, -102), "pending", "still only PENDING -- nobody approved anything");
++});
++
++await test("pressing Verify succeeds on pending requests alone", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  // Record the requests without triggering the handler's own auto-verify, so
++  // it is the Verify button doing the work.
++  await dbmod.recordJoinRequest(w.env.DB, B, -101, w.tick());
++  await dbmod.recordJoinRequest(w.env.DB, B, -102, w.tick());
++  assert.equal(w.verified(B), false);
++  await w.verify(B);
++  assert.equal(w.verified(B), true, "verification must not require admin approval or chat_member");
++  assert.match(w.lastText(B), /verified/i);
++});
++
++// =============================================================================
++console.log("\nTest 3 — a pending request gives the referral credit, exactly once");
++
++await test("B verifies before any admin approval and A is credited +1", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  assert.equal(w.count(A), 0);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  assert.equal(w.count(A), 0, "one chat outstanding: not yet");
++  await w.joinRequest(B, -102);
++
++  assert.equal(w.verified(B), true);
++  assert.equal(w.count(A), 1, "credit is immediate -- it does not wait for the admin");
++  assert.equal(w.called("approveChatJoinRequest").length, 0);
++  assert.equal(w.called("chat_member").length, 0);
++  assert.ok(w.user(B).verified_at, "verified_at is stamped");
++});
++
++await test("the referral relationship still comes from the referral code, unchanged", async () => {
++  const w = makeWorld();
++  await w.start(1);
++  const code = w.user(1).referral_code;
++  assert.match(code, /^[A-Za-z0-9]{8}$/, "an 8-character code, not a sequential number");
++  await w.start(2, code);
++  assert.equal(w.user(2).referred_by, 1);
++  await w.start(3, code + "x"); // unknown payload
++  assert.equal(w.user(3).referred_by, null);
++  await w.start(1, code); // self-referral
++  assert.equal(w.user(1).referred_by, null);
++  await w.start(2, w.user(3).referral_code); // an existing user cannot be re-parented
++  assert.equal(w.user(2).referred_by, 1, "referred_by is set once and never overwritten");
++});
++
++await test("an organic user (no referrer) still verifies on pending requests", async () => {
++  const w = makeWorld();
++  await w.start(7);
++  await w.contact(7);
++  await w.joinRequest(7, -101);
++  await w.joinRequest(7, -102);
++  assert.equal(w.verified(7), true);
++});
++
++// =============================================================================
++console.log("\nTest 4 — repeated verification is idempotent");
++
++await test("Verify x3, /start x2, duplicate requests and duplicate approvals credit A once", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  await w.contact(B);
++  const t1 = w.tick();
++  await w.joinRequest(B, -101, t1);
++  await w.joinRequest(B, -102, w.tick());
++  assert.equal(w.count(A), 1);
++
++  for (let i = 0; i < 3; i++) await w.verify(B);
++  await w.start(B);
++  await w.start(B);
++  await w.joinRequest(B, -101, t1); // Telegram redelivers the very same update
++  assert.equal(w.count(A), 1, "repeat presses / redeliveries must not credit again");
++
++  // The admin now approves both, and Telegram redelivers those too.
++  const a1 = w.tick();
++  const a2 = w.tick();
++  await w.chatMember(B, -101, "member", a1);
++  await w.chatMember(B, -101, "member", a1);
++  await w.chatMember(B, -102, "member", a2);
++  await w.chatMember(B, -102, "member", a2);
++  await w.verify(B);
++
++  assert.equal(w.verified(B), true);
++  assert.equal(w.count(A), 1, "approval turns pending into member; it is not a second credit");
++  assert.equal(w.state(B, -101), "member");
++});
++
++await test("membership reconciliation running repeatedly cannot double-credit", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  w.members = { [`-101:${B}`]: "member", [`-102:${B}`]: "member" };
++  await w.contact(B);
++  for (let i = 0; i < 4; i++) {
++    await w.verify(B);
++    await w.start(B);
++  }
++  assert.equal(w.count(A), 1);
++});
++
++await test("if the user leaves and returns, the credit is taken back once and restored once", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  await w.joinRequest(B, -102);
++  assert.equal(w.count(A), 1);
++
++  const left = w.tick();
++  await w.chatMember(B, -102, "left", left);
++  await w.chatMember(B, -102, "left", left); // duplicate delivery
++  assert.equal(w.verified(B), false);
++  assert.equal(w.count(A), 0, "taken back exactly once, never below zero");
++
++  await w.joinRequest(B, -102); // asks again
++  await w.joinRequest(B, -102, 1); // an old duplicate arriving late
++  assert.equal(w.verified(B), true);
++  assert.equal(w.count(A), 1, "restored exactly once");
++});
++
++// =============================================================================
++console.log("\nTest 5 — an existing member is recognised");
++
++await test("someone already in every required chat is not told to join", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  w.members = { [`-101:${B}`]: "member", [`-102:${B}`]: "administrator" };
++
++  await w.start(B, w.user(A).referral_code);
++  assert.match(w.lastText(B), /2️⃣ Send a join request to all 2 destinations\s+✅ done/, "/start must show the step as done");
++
++  await w.contact(B);
++  assert.equal(w.verified(B), true);
++  assert.equal(w.count(A), 1);
++  assert.equal(w.state(B, -101), "member", "recorded as ACTUAL membership, not as a pending request");
++  assert.equal(w.state(B, -102), "member");
++  assert.doesNotMatch(w.texts(B).join("\n"), /Send a join request to Chat/, "no 'you still need to join' anywhere");
++});
++
++await test("pressing Verify recognises membership that the database did not know about", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  w.lookupsFail = true; // Telegram is unreachable while they share their contact
++  await w.contact(B);
++  assert.equal(w.verified(B), false, "a failed lookup must not grant anything");
++
++  w.lookupsFail = false;
++  w.members = { [`-101:${B}`]: "member", [`-102:${B}`]: "member" }; // ...and it is back
++  await w.verify(B);
++  assert.equal(w.verified(B), true);
++  assert.equal(w.count(A), 1);
++  assert.match(w.lastText(B), /verified/i);
++  assert.doesNotMatch(w.lastText(B), /Send a join request to/);
++});
++
++await test("a member of one chat with a pending request on the other is satisfied", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  w.members = { [`-101:${B}`]: "member" };
++  await w.contact(B); // recognises -101, still needs -102
++  assert.equal(w.verified(B), false);
++  assert.match(w.lastText(B), /1\/2 done/);
++  await w.joinRequest(B, -102);
++  assert.equal(w.verified(B), true);
++  assert.equal(w.state(B, -101), "member");
++  assert.equal(w.state(B, -102), "pending");
++  assert.equal(w.count(A), 1);
++});
++
++await test("a muted (restricted) user who is still in the chat counts as a member", async () => {
++  const w = makeWorld({ chats: [-101] });
++  await w.start(2);
++  w.members = { "-101:2": "restricted" }; // getChatMember reports is_member: true
++  await w.contact(2);
++  assert.equal(w.verified(2), true);
++});
++
++// =============================================================================
++console.log("\nTest 6 — no request and no membership fails");
++
++await test("with neither, the chat is unsatisfied and verification does not complete", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  await w.contact(B);
++  await w.verify(B);
++
++  assert.equal(w.verified(B), false);
++  assert.equal(w.count(A), 0, "the referrer gets nothing");
++  assert.deepEqual(await w.satisfied(B), { [-101]: 0, [-102]: 0 });
++  assert.match(w.lastText(B), /Send a join request to Chat101/);
++  assert.match(w.lastText(B), /Send a join request to Chat102/);
++});
++
++await test("satisfied chats are never re-checked, so Telegram's ambiguous 'left' cannot erase a pending request", async () => {
++  // getChatMember says 'left' both for someone whose request is pending and for
++  // someone who never asked, so it cannot be trusted to END anything. The
++  // guarantee is structural: reconcile only asks about chats the database has
++  // not already satisfied, and only ever records membership it finds.
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101); // pending; -102 still outstanding
++  w.members = {}; // Telegram would say 'left' for everything
++  w.calls.length = 0;
++  await w.verify(B);
++
++  assert.deepEqual(
++    w.called("getChatMember").map((c) => c.payload.chat_id),
++    [-102],
++    "only the unsatisfied chat is looked up; the pending one costs no API call"
++  );
++  assert.equal(w.state(B, -101), "pending", "and it is left exactly as it was");
++});
++
++await test("a user with nothing missing costs no Telegram lookups at all", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  await w.joinRequest(B, -102);
++  w.calls.length = 0;
++  await w.verify(B);
++  await w.start(B);
++  assert.equal(w.called("getChatMember").length, 0);
++});
++
++await test("an ended chat that Telegram says is 'left' stays ended; one it says is 'member' is restored", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  await w.joinRequest(B, -102);
++  await w.chatMember(B, -102, "left"); // departs; un-verified, A back to 0
++  assert.equal(w.count(A), 0);
++
++  await w.verify(B); // Telegram still says 'left'
++  assert.equal(w.state(B, -102), "ended");
++  assert.equal(w.verified(B), false);
++
++  w.members = { [`-102:${B}`]: "member" }; // they are back in the chat, and we never heard
++  await w.verify(B);
++  assert.equal(w.state(B, -102), "member");
++  assert.equal(w.verified(B), true);
++  assert.equal(w.count(A), 1, "stale-negative data is healed without a chat_member event");
++});
++
++await test("a failed Telegram lookup never counts as a pass", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  w.lookupsFail = true;
++  logged.length = 0;
++  await w.contact(B);
++  await w.verify(B);
++  assert.equal(w.verified(B), false);
++  assert.equal(w.state(B, -101), null);
++  assert.ok(logged.some((l) => /getChatMember failed/.test(l)), "the failure is logged, not silently swallowed");
++});
++
++await test("no contact shared: verification fails even with every request pending", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await dbmod.recordJoinRequest(w.env.DB, B, -101, w.tick());
++  await dbmod.recordJoinRequest(w.env.DB, B, -102, w.tick());
++  await w.verify(B);
++  assert.equal(w.verified(B), false);
++});
++
++await test("a chat that is not required cannot satisfy the requirement", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  w.members = { [`-777:${B}`]: "member" };
++  await w.verify(B);
++  assert.equal(w.verified(B), false, "-102 is still outstanding");
++});
++
++// =============================================================================
++console.log("\nRejected / removed requests are not valid forever");
++
++await test("a removal reported by Telegram ends a pending request and un-verifies, once", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  await w.joinRequest(B, -102);
++  assert.equal(w.count(A), 1);
++
++  await w.chatMember(B, -101, "kicked"); // banned while the request was pending
++  assert.equal(w.state(B, -101), "ended");
++  assert.equal(w.verified(B), false);
++  assert.equal(w.count(A), 0);
++  assert.deepEqual(await w.satisfied(B), { [-101]: 0, [-102]: 1 });
++});
++
++await test("a stale 'left' event cannot end a request the user re-sent afterwards", async () => {
++  const w = makeWorld();
++  const { A, B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101, 100);
++  await w.joinRequest(B, -102, 101);
++  await w.chatMember(B, -101, "left", 200);
++  await w.joinRequest(B, -101, 300);
++  assert.equal(w.count(A), 1);
++  await w.chatMember(B, -101, "left", 200); // the old departure, redelivered
++  assert.equal(w.state(B, -101), "pending");
++  assert.equal(w.verified(B), true);
++  assert.equal(w.count(A), 1, "a redelivered old event must not cost the referrer a credit");
++});
++
++await test("an unclear status (a restricted non-member) leaves stored state alone", async () => {
++  const w = makeWorld();
++  const { B } = await referredUser(w);
++  await w.contact(B);
++  await w.joinRequest(B, -101);
++  await w.chatMember(B, -101, "restricted", w.tick(), { is_member: false });
++  assert.equal(w.state(B, -101), "pending");
++});
++
++await test("membership changes in a chat that is not required are ignored", async () => {
++  const w = makeWorld();
++  await w.start(2);
++  await w.chatMember(2, -777, "member");
++  assert.equal(w.state(2, -777), null);
++});
++
++// =============================================================================
++console.log(`\n${pass} passed, ${failures.length} failed`);
++if (failures.length) {
++  console.log("Failed: " + failures.join("; "));
++  process.exit(1);
++}
+diff --git a/tests/migration.test.mjs b/tests/migration.test.mjs
+index 1b7ad2c..889d072 100644
+--- a/tests/migration.test.mjs
++++ b/tests/migration.test.mjs
+@@ -119,7 +119,7 @@ test("migration is idempotent enough to detect a double-run", () => {
+   assert.throws(() => db.exec(runnable), /duplicate column/i);
+ });
+ 
+-console.log("\nFull migration chain (v1 -> 0002 -> 0003 -> 0004 -> 0005)");
++console.log("\nFull migration chain (v1 -> 0002 -> 0003 -> 0004 -> 0005 -> 0006)");
+ 
+ const strip = (sql) =>
+   sql.split("\n").filter((l) => !l.trim().startsWith("--")).join("\n");
+@@ -137,6 +137,7 @@ for (const f of [
+   "0003_phone_lookup_and_referrer.sql",
+   "0004_membership_and_rewards.sql",
+   "0005_reward_snapshot.sql",
++  "0006_join_request_status.sql",
+ ]) {
+   test(`${f} applies cleanly on top of the previous ones`, () => {
+     try {
+@@ -163,6 +164,8 @@ test("the fully migrated schema has every column the code reads", () => {
+   }
+   const jr = chainDb.prepare("SELECT name FROM pragma_table_info('join_requests')").all().map((r) => r.name);
+   assert.ok(jr.includes("active"), "join_requests.active missing after the full chain");
++  assert.ok(jr.includes("status"), "join_requests.status missing after the full chain");
++  assert.ok(jr.includes("event_at"), "join_requests.event_at missing after the full chain");
+ });
+ 
+ test("a user who qualified BEFORE 0005 gets a backfilled settlement", () => {
+@@ -207,5 +210,123 @@ test("an unqualified user is left alone by the backfill", () => {
+   assert.equal(r.i, null, "never qualified, so nothing is owed and nothing is recorded");
+ });
+ 
++
++console.log("\nMigration 0006: join-request status (pending / member / ended)");
++
++const upTo0005 = [
++  "0002_dynamic_requirements.sql",
++  "0003_phone_lookup_and_referrer.sql",
++  "0004_membership_and_rewards.sql",
++  "0005_reward_snapshot.sql",
++];
++const m0006 = strip(readFileSync(new URL("../migrations/0006_join_request_status.sql", import.meta.url), "utf8"));
++
++/** A database as it stands in production today: through 0005, populated. */
++function productionDb() {
++  const d = new DatabaseSync(":memory:");
++  d.exec(v1Schema);
++  // 1 = referrer, 2 = verified referral, 3 = mid-flow, 4 = verified then left one chat.
++  d.prepare("INSERT INTO users (telegram_user_id, referral_code, contact_shared, verified, verified_referral_count, qualified, qualified_at) VALUES (1, 'r1', 1, 1, 2, 0, NULL)").run();
++  d.prepare("INSERT INTO users (telegram_user_id, referral_code, referred_by, phone_number, contact_shared, verified) VALUES (2, 'r2', 1, '+911111111111', 1, 1)").run();
++  d.prepare("INSERT INTO users (telegram_user_id, referral_code, referred_by, phone_number, contact_shared, verified) VALUES (3, 'r3', 1, '+912222222222', 1, 0)").run();
++  d.prepare("INSERT INTO users (telegram_user_id, referral_code, referred_by, phone_number, contact_shared, verified) VALUES (4, 'r4', 1, '+913333333333', 1, 1)").run();
++  for (const f of upTo0005) d.exec(strip(readFileSync(new URL(`../migrations/${f}`, import.meta.url), "utf8")));
++  const ins = d.prepare("INSERT OR REPLACE INTO join_requests (telegram_user_id, chat_id, active, requested_at) VALUES (?, ?, ?, ?)");
++  for (const c of [-1004493745060, -1004365591682, -1004309711460]) ins.run(2, c, 1, "2026-01-05 10:00:00");
++  ins.run(3, -1004493745060, 1, "2026-02-01 09:00:00");
++  ins.run(4, -1004493745060, 1, "2026-01-07 10:00:00");
++  ins.run(4, -1004365591682, 0, "2026-01-07 10:01:00"); // left, recorded by the old chat_member handler
++  ins.run(4, -1004309711460, 1, "2026-01-07 10:02:00");
++  return d;
++}
++
++const snapshot = (d) => ({
++  users: d.prepare("SELECT * FROM users ORDER BY telegram_user_id").all(),
++  required: d.prepare("SELECT * FROM required_chats ORDER BY chat_id").all(),
++  jr: d
++    .prepare("SELECT telegram_user_id u, chat_id c, requested_at r, active a FROM join_requests ORDER BY 1, 2")
++    .all(),
++});
++
++const before = (() => { const d = productionDb(); return { d, snap: snapshot(d) }; })();
++before.d.exec(m0006);
++const after = snapshot(before.d);
++
++test("no user, referral count, verification state or chat row changes", () => {
++  assert.deepEqual(after.users, before.snap.users, "users table must be byte-for-byte unchanged");
++  assert.deepEqual(after.required, before.snap.required);
++});
++
++test("no join_requests row is lost, and the original columns are untouched", () => {
++  assert.deepEqual(after.jr, before.snap.jr);
++});
++
++test("a row that was active (live, auto-approved) becomes 'member'", () => {
++  const r = before.d.prepare("SELECT status FROM join_requests WHERE telegram_user_id = 2").all();
++  assert.equal(r.length, 3);
++  assert.ok(r.every((x) => x.status === "member"));
++});
++
++test("a row that was inactive (left) becomes 'ended'", () => {
++  const r = before.d.prepare("SELECT status FROM join_requests WHERE telegram_user_id = 4 AND chat_id = -1004365591682").get();
++  assert.equal(r.status, "ended");
++});
++
++test("existing rows carry event_at = 0 so the first live event wins", () => {
++  const n = before.d.prepare("SELECT COUNT(*) c FROM join_requests WHERE event_at <> 0").get().c;
++  assert.equal(n, 0);
++});
++
++test("users who were verified before the migration are still verified afterwards", () => {
++  const v = before.d.prepare("SELECT telegram_user_id id, verified FROM users ORDER BY 1").all();
++  assert.deepEqual(v.map((x) => x.verified), [1, 1, 0, 1]);
++  assert.equal(before.d.prepare("SELECT verified_referral_count c FROM users WHERE telegram_user_id = 1").get().c, 2);
++});
++
++test("`active` still mirrors the new status for every migrated row", () => {
++  const bad = before.d.prepare("SELECT COUNT(*) c FROM join_requests WHERE active <> (status <> 'ended')").get().c;
++  assert.equal(bad, 0);
++});
++
++test("the status index exists and the old one is kept for rollback", () => {
++  const idx = before.d.prepare("SELECT name FROM pragma_index_list('join_requests')").all().map((r) => r.name);
++  assert.ok(idx.includes("idx_join_requests_status"));
++  assert.ok(idx.includes("idx_join_requests_active"));
++});
++
++test("the CHECK constraint is enforced on a migrated database too", () => {
++  assert.throws(
++    () => before.d.prepare("INSERT INTO join_requests (telegram_user_id, chat_id, status) VALUES (9, -1, 'nope')").run(),
++    /CHECK/i
++  );
++});
++
++test("a migrated database has the same join_requests shape as a fresh install", () => {
++  const fresh = new DatabaseSync(":memory:");
++  fresh.exec(readFileSync(new URL("../schema.sql", import.meta.url), "utf8"));
++  const shape = (d) =>
++    d.prepare("SELECT name, type, \"notnull\" nn, dflt_value d, pk FROM pragma_table_info('join_requests') ORDER BY name").all();
++  assert.deepEqual(shape(before.d), shape(fresh), "schema.sql and the migration chain have drifted apart");
++});
++
++test("running 0006 twice fails loudly instead of corrupting state", () => {
++  assert.throws(() => before.d.exec(m0006), /duplicate column/i);
++});
++
++test("a legacy 'member' row still satisfies the requirement (nobody is un-verified)", () => {
++  // The verification statement as shipped in src/db.ts, against migrated data.
++  const src = readFileSync(new URL("../src/db.ts", import.meta.url), "utf8");
++  const m = src.match(/`UPDATE users\s+SET verified = 1[\s\S]*?RETURNING referred_by`/);
++  assert.ok(m, "could not find tryClaimVerification in src/db.ts");
++  const claimSql = m[0].slice(1, -1);
++  // User 3 is mid-flow: one chat done. Finish the other two as pending requests.
++  before.d.prepare("INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at) VALUES (3, -1004365591682, 'pending', 1)").run();
++  assert.equal(before.d.prepare(claimSql).get(3, 3), undefined, "one chat still missing");
++  before.d.prepare("INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at) VALUES (3, -1004309711460, 'pending', 1)").run();
++  const row = before.d.prepare(claimSql).get(3, 3);
++  assert.ok(row, "legacy 'member' + new 'pending' rows together must verify");
++  assert.equal(row.referred_by, 1);
++});
++
+ console.log(`\n${pass} passed, ${failures.length} failed`);
+ if (failures.length) process.exit(1);
+diff --git a/tests/sql.test.mjs b/tests/sql.test.mjs
+index 3341d56..21bc298 100644
+--- a/tests/sql.test.mjs
++++ b/tests/sql.test.mjs
+@@ -27,7 +27,7 @@ const SQL = {
+                WHERE rc.active = 1
+                  AND NOT EXISTS (
+                        SELECT 1 FROM join_requests jr
+-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
++                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
+                      )
+              )
+        RETURNING referred_by`,
+@@ -40,10 +40,37 @@ const SQL = {
+                WHERE rc.active = 1
+                  AND NOT EXISTS (
+                        SELECT 1 FROM join_requests jr
+-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.active = 1
++                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
+                      )
+              )
+        RETURNING referred_by`,
++  requiredChatsWithStatus: `SELECT rc.*,
++              EXISTS (
++                SELECT 1 FROM join_requests jr
++                WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
++              ) AS satisfied
++       FROM required_chats rc
++       WHERE rc.active = 1
++       ORDER BY rc.added_at ASC`,
++  missingChats: `SELECT rc.* FROM required_chats rc
++       WHERE rc.active = 1
++         AND NOT EXISTS (
++               SELECT 1 FROM join_requests jr
++               WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
++             )
++       ORDER BY rc.added_at ASC`,
++  recordJoinRequest: `INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at, active)
++       VALUES (?, ?, 'pending', ?, 1)
++       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE
++         SET status = 'pending', event_at = excluded.event_at, active = 1
++         WHERE excluded.event_at > join_requests.event_at`,
++  markJoinMember: `INSERT INTO join_requests (telegram_user_id, chat_id, status, event_at, active)
++       VALUES (?, ?, 'member', ?, 1)
++       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE
++         SET status = 'member', event_at = excluded.event_at, active = 1
++         WHERE excluded.event_at >= join_requests.event_at AND join_requests.status <> 'member'`,
++  markJoinEnded: `UPDATE join_requests SET status = 'ended', event_at = ?, active = 0
++       WHERE telegram_user_id = ? AND chat_id = ? AND status <> 'ended' AND ? >= event_at`,
+   decrement: `UPDATE users SET verified_referral_count = MAX(0, verified_referral_count - 1)
+        WHERE telegram_user_id = ?`,
+   claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now'),
+@@ -244,15 +271,14 @@ test("duplicate join requests are idempotent", () => {
+ 
+ console.log("\nLeaving a chat stops the referral counting");
+ 
+-const leave = (db, userId, chatId) =>
+-  db.prepare("UPDATE join_requests SET active = 0 WHERE telegram_user_id = ? AND chat_id = ?").run(userId, chatId);
+-const rejoin = (db, userId, chatId) =>
+-  db
+-    .prepare(
+-      `INSERT INTO join_requests (telegram_user_id, chat_id, active) VALUES (?, ?, 1)
+-       ON CONFLICT(telegram_user_id, chat_id) DO UPDATE SET active = 1`
+-    )
+-    .run(userId, chatId);
++// Departure and rejoin go through the same statements the application runs.
++// `at` is the Telegram event time; tests advance it so each event is "newer".
++let clock = 1_000;
++const tick = () => ++clock;
++const leave = (db, userId, chatId, at = tick()) =>
++  db.prepare(SQL.markJoinEnded).run(at, userId, chatId, at).changes > 0;
++const rejoin = (db, userId, chatId, at = tick()) =>
++  db.prepare(SQL.recordJoinRequest).run(userId, chatId, at).changes > 0;
+ const revokeRow = (db, id) => db.prepare(SQL.revokeVerification).get(id, id);
+ const revoke = (db, id) => revokeRow(db, id) !== undefined;
+ const decrement = (db, id) => db.prepare(SQL.decrement).run(id);
+@@ -274,7 +300,7 @@ test("the revoke returns the referrer to debit, in the same statement", () => {
+   addUser(db, 2, { referredBy: 1, contact: true });
+   for (const c of [-101, -102, -103]) join(db, 2, c);
+   claim(db, 2);
+-  db.prepare("UPDATE join_requests SET active = 0 WHERE telegram_user_id = 2 AND chat_id = -102").run();
++  leave(db, 2, -102);
+   const row = revokeRow(db, 2);
+   assert.ok(row, "a successful revoke must return a row");
+   assert.equal(row.referred_by, 1);
+@@ -334,6 +360,215 @@ test("the count can never go negative", () => {
+   assert.equal(countOf(db, 1), 0, "MAX(0, ...) must floor it");
+ });
+ 
++console.log("\nPending request vs actual membership");
++
++const setState = (db, u, c, state, at = tick()) => {
++  if (state === "pending") return rejoin(db, u, c, at);
++  if (state === "member") return db.prepare(SQL.markJoinMember).run(u, c, at).changes > 0;
++  if (state === "ended") return leave(db, u, c, at);
++  throw new Error(state);
++};
++const statusOf = (db, u, c) =>
++  db.prepare("SELECT status, active, event_at FROM join_requests WHERE telegram_user_id = ? AND chat_id = ?").get(u, c);
++const satisfiedOf = (db, u) =>
++  Object.fromEntries(db.prepare(SQL.requiredChatsWithStatus).all(u).map((r) => [r.chat_id, r.satisfied]));
++const missingOf = (db, u) => db.prepare(SQL.missingChats).all(u).map((r) => r.chat_id);
++
++/** A referred user with contact shared and a state for each of -101..-103. */
++function withStates(states) {
++  const db = freshDb();
++  addUser(db, 1);
++  addUser(db, 2, { referredBy: 1, contact: true });
++  [-101, -102, -103].forEach((c, i) => states[i] && setState(db, 2, c, states[i]));
++  return db;
++}
++
++test("a PENDING request satisfies the requirement", () => {
++  const db = withStates(["pending", "pending", "pending"]);
++  assert.equal(claim(db, 2), true, "verification must not wait for an admin");
++  assert.deepEqual(satisfiedOf(db, 2), { [-101]: 1, [-102]: 1, [-103]: 1 });
++  assert.deepEqual(missingOf(db, 2), []);
++});
++
++test("actual MEMBERSHIP satisfies the requirement", () => {
++  const db = withStates(["member", "member", "member"]);
++  assert.equal(claim(db, 2), true);
++  assert.deepEqual(missingOf(db, 2), []);
++});
++
++test("pending and member can be mixed across chats", () => {
++  const db = withStates(["pending", "member", "pending"]);
++  assert.equal(claim(db, 2), true);
++});
++
++test("an ENDED request does not satisfy the requirement", () => {
++  const db = withStates(["pending", "pending", "ended"]);
++  assert.equal(claim(db, 2), false);
++  assert.deepEqual(satisfiedOf(db, 2), { [-101]: 1, [-102]: 1, [-103]: 0 });
++  assert.deepEqual(missingOf(db, 2), [-103]);
++});
++
++test("NO row at all does not satisfy the requirement", () => {
++  const db = withStates(["pending", "pending", null]);
++  assert.equal(claim(db, 2), false);
++  assert.deepEqual(missingOf(db, 2), [-103]);
++});
++
++test("the three queries that ask 'is this satisfied' can never disagree", () => {
++  // The user's instruction: one coherent definition, not one fixed query and
++  // one left on the old meaning. Check every state against all three.
++  for (const state of ["pending", "member", "ended", null]) {
++    const db = withStates([state, "pending", "pending"]);
++    const satisfied = satisfiedOf(db, 2)[-101] === 1;
++    const missing = missingOf(db, 2).includes(-101);
++    assert.equal(satisfied, !missing, `status=${state}: satisfied vs missing disagree`);
++    assert.equal(claim(db, 2), satisfied, `status=${state}: claim disagrees with the status query`);
++  }
++});
++
++test("the admin approving a pending request changes nothing for the referrer", () => {
++  const db = withStates(["pending", "pending", "pending"]);
++  assert.equal(claim(db, 2), true);
++  // chat_member arrives: pending -> member. Both satisfy, so nothing to revoke.
++  assert.equal(setState(db, 2, -102, "member"), true);
++  assert.equal(revoke(db, 2), false, "approval must not un-verify or re-credit anyone");
++  assert.equal(claim(db, 2), false, "already verified: no second credit");
++  assert.equal(isVerified(db, 2), true);
++});
++
++test("a request that is later removed stops satisfying, and revokes once", () => {
++  const db = withStates(["pending", "pending", "pending"]);
++  claim(db, 2);
++  assert.equal(setState(db, 2, -101, "ended"), true, "kicked/left while still requested");
++  assert.equal(revoke(db, 2), true);
++  assert.equal(revoke(db, 2), false);
++});
++
++test("re-requesting after an ended request satisfies again", () => {
++  const db = withStates(["pending", "pending", "ended"]);
++  assert.equal(claim(db, 2), false);
++  assert.equal(setState(db, 2, -103, "pending"), true);
++  assert.equal(claim(db, 2), true);
++});
++
++console.log("\nDuplicate and out-of-order webhook deliveries");
++
++test("a duplicate join request changes nothing", () => {
++  const db = freshDb();
++  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 500).changes, 1);
++  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 500).changes, 0, "same event again is a no-op");
++  assert.equal(statusOf(db, 2, -101).status, "pending");
++});
++
++test("a stale duplicate request cannot demote an approved member", () => {
++  const db = freshDb();
++  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
++  db.prepare(SQL.markJoinMember).run(2, -101, 600);
++  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 500).changes, 0);
++  assert.equal(statusOf(db, 2, -101).status, "member");
++});
++
++test("a stale duplicate request cannot resurrect a departure", () => {
++  const db = freshDb();
++  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
++  db.prepare(SQL.markJoinMember).run(2, -101, 600);
++  db.prepare(SQL.markJoinEnded).run(700, 2, -101, 700);
++  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 500).changes, 0, "old request replayed");
++  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 600).changes, 0, "old approval replayed");
++  assert.equal(statusOf(db, 2, -101).status, "ended");
++});
++
++test("a stale departure cannot end a request the user has since re-sent", () => {
++  const db = freshDb();
++  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
++  db.prepare(SQL.markJoinEnded).run(600, 2, -101, 600);
++  db.prepare(SQL.recordJoinRequest).run(2, -101, 700); // re-requests
++  assert.equal(db.prepare(SQL.markJoinEnded).run(600, 2, -101, 600).changes, 0, "old 'left' replayed");
++  assert.equal(statusOf(db, 2, -101).status, "pending");
++});
++
++test("a genuinely newer request after leaving is honoured", () => {
++  const db = freshDb();
++  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
++  db.prepare(SQL.markJoinEnded).run(600, 2, -101, 600);
++  assert.equal(db.prepare(SQL.recordJoinRequest).run(2, -101, 700).changes, 1);
++  assert.equal(statusOf(db, 2, -101).status, "pending");
++});
++
++test("a duplicate membership event changes nothing", () => {
++  const db = freshDb();
++  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 500).changes, 1);
++  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 500).changes, 0);
++});
++
++test("approval in the same second as the request still promotes it", () => {
++  const db = freshDb();
++  db.prepare(SQL.recordJoinRequest).run(2, -101, 500);
++  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 500).changes, 1);
++  assert.equal(statusOf(db, 2, -101).status, "member");
++});
++
++test("a departure from a chat the user never touched records nothing", () => {
++  const db = freshDb();
++  assert.equal(db.prepare(SQL.markJoinEnded).run(500, 2, -101, 500).changes, 0);
++  assert.equal(db.prepare("SELECT COUNT(*) c FROM join_requests").get().c, 0, "must not create a row");
++});
++
++test("a member who never sent a request through the bot is recognised", () => {
++  const db = freshDb();
++  assert.equal(db.prepare(SQL.markJoinMember).run(2, -101, 500).changes, 1);
++  assert.equal(statusOf(db, 2, -101).status, "member");
++});
++
++test("a legacy row (event_at = 0) yields to the first real event", () => {
++  const db = freshDb();
++  db.prepare("INSERT INTO join_requests (telegram_user_id, chat_id, status) VALUES (2, -101, 'member')").run();
++  assert.equal(statusOf(db, 2, -101).event_at, 0);
++  assert.equal(db.prepare(SQL.markJoinEnded).run(500, 2, -101, 500).changes, 1);
++});
++
++console.log("\nSchema guarantees");
++
++test("`active` stays a faithful mirror of (status <> 'ended') through every transition", () => {
++  const db = freshDb();
++  const seq = ["pending", "member", "ended", "pending", "ended", "member"];
++  for (const st of seq) {
++    setState(db, 2, -101, st);
++    const r = statusOf(db, 2, -101);
++    assert.equal(r.status, st);
++    assert.equal(r.active, st === "ended" ? 0 : 1, `active drifted at ${st}`);
++  }
++});
++
++test("an unknown status is rejected by the CHECK constraint", () => {
++  const db = freshDb();
++  assert.throws(
++    () => db.prepare("INSERT INTO join_requests (telegram_user_id, chat_id, status) VALUES (2, -101, 'approved')").run(),
++    /CHECK/i
++  );
++});
++
++test("no application code reads the ambiguous `active` column of join_requests", () => {
++  // Every statement that decides 'satisfied' must use status IN ('pending','member').
++  // `jr.active` (or a bare join_requests.active read) means one path kept the old meaning.
++  assert.ok(!/\bjr\.active\b/.test(dbSource), "src/db.ts still reads jr.active");
++  const other = ["bot.ts", "verification.ts", "payments.ts", "index.ts"].map((f) =>
++    readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8")
++  );
++  for (const src of other) assert.ok(!/join_requests[\s\S]{0,80}\bactive\b/.test(src), "raw join_requests.active read outside db.ts");
++  assert.ok(!/setJoinRequestActive/.test(dbSource), "the old boolean setter still exists");
++});
++
++test("every join_requests lookup in db.ts uses the one satisfied predicate", () => {
++  // A subquery over `join_requests jr` that omits the predicate (or filters on
++  // some other status) would silently redefine "satisfied" for that path.
++  const lookups = dbSource.match(/FROM join_requests jr/g) ?? [];
++  const predicate = dbSource.match(/jr\.status IN \('pending', 'member'\)/g) ?? [];
++  assert.equal(lookups.length, 4, "status query, missing query, claim, revoke -- add a test if a fifth appears");
++  assert.equal(predicate.length, lookups.length, "a join_requests lookup is missing the shared predicate");
++  assert.ok(!/jr\.status\s*(=|<>|!=)/.test(dbSource), "a lookup compares status directly instead of using the predicate");
++});
++
+ console.log("\nPhone-number uniqueness (anti-sybil)");
+ 
+ const shareContact = (db, id, phone) =>
+diff --git a/tests/webhook.test.mjs b/tests/webhook.test.mjs
+new file mode 100644
+index 0000000..7a8f9f5
+--- /dev/null
++++ b/tests/webhook.test.mjs
+@@ -0,0 +1,162 @@
++// Static guards over the source tree and the documented webhook registration.
++//
++// Two things here cannot be caught by running a handler, because the failure is
++// a line of text somewhere:
++//
++//   * something in the codebase approving join requests automatically
++//   * the webhook's allowed_updates omitting a type the bot handles -- Telegram
++//     simply never sends those updates, so the handler is dead code and nothing
++//     errors. This is exactly how the chat_member handler went unused.
++//
++// The webhook is registered by hand (the README's curl); no code calls
++// setWebhook. So the README IS the configuration, and it is what is checked.
++//
++// Run with: npm run test:webhook
++
++import { readFileSync, readdirSync, statSync } from "node:fs";
++import { join, relative } from "node:path";
++import assert from "node:assert/strict";
++
++const root = new URL("..", import.meta.url).pathname;
++const read = (rel) => readFileSync(join(root, rel), "utf8");
++
++let pass = 0;
++const failures = [];
++function test(name, fn) {
++  try {
++    fn();
++    pass++;
++    console.log(`  ✓ ${name}`);
++  } catch (err) {
++    failures.push(name);
++    console.log(`  ✗ ${name}\n      ${err.message}`);
++  }
++}
++
++/** Every file under a directory, skipping dependencies and build output. */
++function walk(dir, out = []) {
++  for (const name of readdirSync(dir)) {
++    if (["node_modules", ".git", "dist", ".wrangler"].includes(name)) continue;
++    const p = join(dir, name);
++    if (statSync(p).isDirectory()) walk(p, out);
++    else out.push(p);
++  }
++  return out;
++}
++
++/** Source with comments removed, so prose about approval is not mistaken for a call. */
++const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
++
++const srcFiles = walk(join(root, "src")).filter((f) => f.endsWith(".ts"));
++
++// =============================================================================
++console.log("\nTest 7 — join requests are never approved automatically");
++
++test("approveChatJoinRequest does not appear anywhere in src/", () => {
++  const hits = srcFiles.filter((f) => /approveChatJoinRequest/i.test(readFileSync(f, "utf8")));
++  assert.deepEqual(hits.map((f) => relative(root, f)), []);
++});
++
++test("no code in src/ calls any approve*() method or wrapper", () => {
++  const calls = [];
++  for (const f of srcFiles) {
++    const code = stripComments(readFileSync(f, "utf8"));
++    for (const m of code.matchAll(/\b(\w*[aA]pprove\w*)\s*\(/g)) calls.push(`${relative(root, f)}: ${m[1]}(`);
++  }
++  assert.deepEqual(calls, [], "something approves users; the admin must do that");
++});
++
++test("the chat_join_request handler makes no approval decision", () => {
++  const bot = stripComments(read("src/bot.ts"));
++  const start = bot.indexOf('bot.on("chat_join_request"');
++  const end = bot.indexOf("bot.on(", start + 1);
++  assert.ok(start > -1 && end > start, "could not isolate the chat_join_request handler");
++  const handler = bot.slice(start, end);
++  assert.ok(!/approve/i.test(handler), "the handler references approval");
++  // What it MAY do: record the request, and refuse people who skipped the bot.
++  assert.ok(/recordJoinRequest/.test(handler), "the handler must record the request");
++});
++
++test("the docs no longer promise automatic approval", () => {
++  const promises = [];
++  for (const rel of ["README.md", "src/bot.ts"]) {
++    for (const line of read(rel).split("\n")) {
++      if (/approv\w*\s+automatically|automatically\s+approv/i.test(line)) promises.push(`${rel}: ${line.trim()}`);
++    }
++  }
++  assert.deepEqual(promises, []);
++});
++
++// =============================================================================
++console.log("\nTest 8 — webhook allowed_updates matches what the bot handles");
++
++/** Update types the application registers handlers for, derived from src/bot.ts. */
++function handledUpdateTypes() {
++  const bot = stripComments(read("src/bot.ts"));
++  const types = new Set();
++  // bot.command(...) is a text message.
++  if (/bot\.command\(/.test(bot)) types.add("message");
++  // bot.on("message:text"), bot.on("callback_query:data"), bot.on("chat_member"), ...
++  for (const m of bot.matchAll(/bot\.on\(\s*"([a-z_]+)(?::[a-z_:]+)?"/g)) types.add(m[1]);
++  return types;
++}
++
++/** Every allowed_updates list written down anywhere in the repo's config, docs or code. */
++function declaredLists() {
++  const found = [];
++  const files = walk(root).filter(
++    (f) => !f.includes("/tests/") && /\.(md|ts|toml|json|sh|mjs)$/.test(f) && !f.endsWith("package-lock.json")
++  );
++  for (const f of files) {
++    const text = readFileSync(f, "utf8");
++    for (const m of text.matchAll(/allowed_updates[^\[\n]*\[([^\]]*)\]/g)) {
++      found.push({ file: relative(root, f), types: new Set([...m[1].matchAll(/([a-z_]+)/g)].map((x) => x[1])) });
++    }
++  }
++  return found;
++}
++
++test("the bot's handlers are found (guards against the parser going blind)", () => {
++  const handled = handledUpdateTypes();
++  for (const t of ["message", "callback_query", "chat_join_request", "chat_member", "my_chat_member", "pre_checkout_query"]) {
++    assert.ok(handled.has(t), `expected a handler for ${t}`);
++  }
++});
++
++test("the webhook registration in the README is found", () => {
++  assert.ok(declaredLists().some((l) => l.file === "README.md"), "no allowed_updates list in README.md");
++});
++
++test("allowed_updates includes chat_member", () => {
++  // The chat_member handler keeps `member` state in step with Telegram (approvals,
++  // departures). Telegram only sends it when it is asked for by name.
++  for (const l of declaredLists()) assert.ok(l.types.has("chat_member"), `${l.file} omits chat_member`);
++});
++
++test("allowed_updates includes every update type the bot handles", () => {
++  const handled = handledUpdateTypes();
++  for (const l of declaredLists()) {
++    const missing = [...handled].filter((t) => !l.types.has(t));
++    assert.deepEqual(missing, [], `${l.file} would leave these handlers dead: ${missing.join(", ")}`);
++  }
++});
++
++test("allowed_updates lists nothing the bot does not handle", () => {
++  const handled = handledUpdateTypes();
++  for (const l of declaredLists()) {
++    const extra = [...l.types].filter((t) => !handled.has(t));
++    assert.deepEqual(extra, [], `${l.file} subscribes to unused update types: ${extra.join(", ")}`);
++  }
++});
++
++test("every declared list agrees with every other", () => {
++  const lists = declaredLists().map((l) => [...l.types].sort().join(","));
++  assert.equal(new Set(lists).size, 1, "two places disagree about allowed_updates");
++});
++
++// =============================================================================
++console.log(`\n${pass} passed, ${failures.length} failed`);
++if (failures.length) {
++  console.log("Failed: " + failures.join("; "));
++  process.exit(1);
++}
