@@ -1,6 +1,6 @@
 import type { Api } from "grammy";
 import type { Env } from "./types";
-import { qualifyThreshold, referralRewardInr } from "./types";
+import { qualifyThreshold } from "./types";
 import {
   decrementVerifiedReferralCount,
   getMissingRequiredChats,
@@ -108,10 +108,10 @@ export async function tryVerifyAndQualify(
     return;
   }
 
-  // Not newly verified. They may instead have just stopped qualifying -- they
-  // no longer have a pending request or membership somewhere. Revoking is the
-  // exact mirror of claiming and is equally single-shot, so only one caller
-  // ever takes the credit back.
+  // Not newly verified. They may instead have just left a required chat, which
+  // ends their credit. Revoking is the mirror of claiming and is equally
+  // single-shot, so only one caller ever takes the credit back. A chat an admin
+  // has merely ADDED does not count against them: see tryRevokeVerification.
   const revoke = await tryRevokeVerification(env.DB, userId);
   if (revoke.changed) await creditReferrer(env, api, revoke.referredBy, -1);
 }
@@ -143,12 +143,7 @@ async function creditReferrer(
   // referrer who somehow passes the threshold without this branch running (a
   // racing increment, a manual correction, a count that dipped and recovered)
   // still qualifies on their next referral instead of being stranded.
-  const newlyQualified = await tryClaimQualification(
-    env.DB,
-    referrerId,
-    qualifyThreshold(env),
-    referralRewardInr(env)
-  );
+  const newlyQualified = await tryClaimQualification(env.DB, referrerId, qualifyThreshold(env));
   if (newlyQualified) await announceQualification(env, api, referrerId);
 }
 

@@ -37,11 +37,10 @@ const SQL = {
          AND verified = 1
          AND EXISTS (
                SELECT 1 FROM required_chats rc
+               JOIN join_requests jr ON jr.chat_id = rc.chat_id
                WHERE rc.active = 1
-                 AND NOT EXISTS (
-                       SELECT 1 FROM join_requests jr
-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
-                     )
+                 AND jr.telegram_user_id = ?
+                 AND jr.status = 'ended'
              )
        RETURNING referred_by`,
   requiredChatsWithStatus: `SELECT rc.*,
@@ -73,9 +72,7 @@ const SQL = {
        WHERE telegram_user_id = ? AND chat_id = ? AND status <> 'ended' AND ? >= event_at`,
   decrement: `UPDATE users SET verified_referral_count = MAX(0, verified_referral_count - 1)
        WHERE telegram_user_id = ?`,
-  claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now'),
-              reward_settled_inr = MIN(verified_referral_count, ?) * ?,
-              reward_settled_at = datetime('now')
+  claimQualification: `UPDATE users SET qualified = 1, qualified_at = datetime('now')
        WHERE telegram_user_id = ? AND qualified = 0 AND verified_referral_count >= ?`,
   setContactShared: `UPDATE users SET contact_shared = 1, phone_number = ?, phone_normalized = ?, phone_tail = ?
        WHERE telegram_user_id = ?
@@ -559,14 +556,83 @@ test("no application code reads the ambiguous `active` column of join_requests",
   assert.ok(!/setJoinRequestActive/.test(dbSource), "the old boolean setter still exists");
 });
 
-test("every join_requests lookup in db.ts uses the one satisfied predicate", () => {
+test("every 'is this chat satisfied' lookup in db.ts uses the one predicate", () => {
   // A subquery over `join_requests jr` that omits the predicate (or filters on
   // some other status) would silently redefine "satisfied" for that path.
   const lookups = dbSource.match(/FROM join_requests jr/g) ?? [];
   const predicate = dbSource.match(/jr\.status IN \('pending', 'member'\)/g) ?? [];
-  assert.equal(lookups.length, 4, "status query, missing query, claim, revoke -- add a test if a fifth appears");
+  assert.equal(lookups.length, 3, "status query, missing query, claim -- add a test if a fourth appears");
   assert.equal(predicate.length, lookups.length, "a join_requests lookup is missing the shared predicate");
-  assert.ok(!/jr\.status\s*(=|<>|!=)/.test(dbSource), "a lookup compares status directly instead of using the predicate");
+});
+
+test("revoking looks only for a recorded departure, never for an unmet requirement", () => {
+  // Revocation is deliberately NOT the inverse of claiming. If it were, adding or
+  // swapping a required chat would un-verify every existing user (and cost their
+  // referrers a credit) the first time they opened the bot.
+  assert.equal((dbSource.match(/jr\.status = 'ended'/g) ?? []).length, 1, "only tryRevokeVerification may test for 'ended'");
+  const start = dbSource.indexOf("export async function tryRevokeVerification");
+  const next = dbSource.indexOf("export async function", start + 10);
+  const revokeSrc = dbSource.slice(start, next === -1 ? undefined : next);
+  assert.ok(revokeSrc.includes("jr.status = 'ended'"), "revoke must look for a departure");
+  assert.ok(!revokeSrc.includes("NOT EXISTS"), "revoke must not be defined as 'some chat is unmet'");
+});
+
+console.log("\nRotating the required list never strips earned verification");
+
+const addChat = (db, id) => db.prepare("INSERT INTO required_chats (chat_id, kind) VALUES (?, 'channel')").run(id);
+const retire = (db, id) => db.prepare("UPDATE required_chats SET active = 0 WHERE chat_id = ?").run(id);
+const verifiedUser = () => {
+  const db = freshDb();
+  addUser(db, 1);
+  addUser(db, 2, { referredBy: 1, contact: true });
+  for (const c of [-101, -102, -103]) join(db, 2, c);
+  claim(db, 2);
+  return db;
+};
+
+test("a verified user is NOT revoked when a new required chat is added", () => {
+  const db = verifiedUser();
+  addChat(db, -201);
+  assert.equal(revoke(db, 2), false, "they have not left anything");
+  assert.equal(isVerified(db, 2), true);
+});
+
+test("swapping every required chat for new channels revokes nobody", () => {
+  const db = verifiedUser();
+  for (const c of [-101, -102, -103]) retire(db, c);
+  for (const c of [-201, -202]) addChat(db, c);
+  assert.equal(revoke(db, 2), false);
+  assert.equal(isVerified(db, 2), true);
+});
+
+test("a NEW user must still satisfy every one of the new channels to verify", () => {
+  const db = verifiedUser();
+  for (const c of [-101, -102, -103]) retire(db, c);
+  for (const c of [-201, -202]) addChat(db, c);
+  addUser(db, 3, { referredBy: 1, contact: true });
+  for (const c of [-101, -102, -103]) join(db, 3, c); // old chats no longer count
+  assert.equal(claim(db, 3), false, "the old chats are retired");
+  join(db, 3, -201);
+  assert.equal(claim(db, 3), false, "one new channel is still missing");
+  join(db, 3, -202);
+  assert.equal(claim(db, 3), true);
+});
+
+test("a verified user who then LEAVES one of the new channels is revoked, once", () => {
+  const db = verifiedUser();
+  addChat(db, -201);
+  join(db, 2, -201);
+  assert.equal(revoke(db, 2), false, "joined, not left");
+  leave(db, 2, -201);
+  assert.equal(revoke(db, 2), true);
+  assert.equal(revoke(db, 2), false, "credit is taken back exactly once");
+});
+
+test("a recorded departure from a chat that is no longer required does not revoke", () => {
+  const db = verifiedUser();
+  leave(db, 2, -101);
+  retire(db, -101);
+  assert.equal(revoke(db, 2), false);
 });
 
 console.log("\nPhone-number uniqueness (anti-sybil)");
@@ -614,10 +680,7 @@ test("the same number written two different ways still collides", () => {
 
 console.log("\nQualification and payment");
 
-const qualify = (db, id, threshold, rate = 10) =>
-  db.prepare(SQL.claimQualification).run(threshold, rate, id, threshold).changes > 0;
-const settled = (db, id) =>
-  db.prepare("SELECT reward_settled_inr i, reward_settled_at a FROM users WHERE telegram_user_id = ?").get(id);
+const qualify = (db, id, threshold) => db.prepare(SQL.claimQualification).run(id, threshold).changes > 0;
 
 test("does not qualify below the threshold", () => {
   const db = freshDb();
@@ -662,65 +725,37 @@ test("a failed payout can be retried on the next referral", () => {
   assert.equal(qualify(db, 1, 200), true);
 });
 
-console.log("\nThe settled figure is frozen at qualification");
+console.log("\nQualification is a plain requirement (no money attached)");
 
-test("qualifying at exactly 200 settles ₹2000", () => {
+test("qualifying records the fact and the time, and nothing monetary", () => {
   const db = freshDb();
   addUser(db, 1);
-  db.prepare("UPDATE users SET verified_referral_count = 200 WHERE telegram_user_id = 1").run();
-  assert.equal(qualify(db, 1, 200, 10), true);
-  const { i, a } = settled(db, 1);
-  assert.equal(i, 2000);
-  assert.ok(a, "a settlement timestamp must be recorded");
+  db.prepare("UPDATE users SET verified_referral_count = 100 WHERE telegram_user_id = 1").run();
+  assert.equal(qualify(db, 1, 100), true);
+  const u = db
+    .prepare("SELECT qualified, qualified_at, reward_settled_inr, reward_settled_at FROM users WHERE telegram_user_id = 1")
+    .get();
+  assert.equal(u.qualified, 1);
+  assert.ok(u.qualified_at);
+  assert.equal(u.reward_settled_inr, null, "no rupee figure is written any more");
+  assert.equal(u.reward_settled_at, null);
 });
 
-test("the settled figure is capped even when the count overshot", () => {
+test("100 verified referrals is enough; 99 is not", () => {
   const db = freshDb();
   addUser(db, 1);
-  db.prepare("UPDATE users SET verified_referral_count = 250 WHERE telegram_user_id = 1").run();
-  qualify(db, 1, 200, 10);
-  assert.equal(settled(db, 1).i, 2000, "250 referrals must still settle at the ₹2000 cap");
+  db.prepare("UPDATE users SET verified_referral_count = 99 WHERE telegram_user_id = 1").run();
+  assert.equal(qualify(db, 1, 100), false);
+  db.prepare("UPDATE users SET verified_referral_count = 100 WHERE telegram_user_id = 1").run();
+  assert.equal(qualify(db, 1, 100), true);
 });
 
-test("the settled figure does NOT erode when referrals later leave", () => {
+test("lowering the threshold qualifies someone already past it, on the next check", () => {
   const db = freshDb();
   addUser(db, 1);
-  db.prepare("UPDATE users SET verified_referral_count = 200 WHERE telegram_user_id = 1").run();
-  qualify(db, 1, 200, 10);
-  assert.equal(settled(db, 1).i, 2000);
-
-  // Three referrals leave: the live count falls, the settlement must not.
-  for (let n = 0; n < 3; n++) decrement(db, 1);
-  assert.equal(countOf(db, 1), 197, "live count follows departures down");
-  assert.equal(settled(db, 1).i, 2000, "the amount owed at qualification is fixed");
-});
-
-test("the snapshot is written once and never rewritten", () => {
-  const db = freshDb();
-  addUser(db, 1);
-  db.prepare("UPDATE users SET verified_referral_count = 200 WHERE telegram_user_id = 1").run();
-  qualify(db, 1, 200, 10);
-  const first = settled(db, 1);
-
-  db.prepare("UPDATE users SET verified_referral_count = 400 WHERE telegram_user_id = 1").run();
-  assert.equal(qualify(db, 1, 200, 10), false, "already qualified");
-  assert.deepEqual(settled(db, 1), first, "a second attempt must not restate the settlement");
-});
-
-test("below the threshold nothing is settled", () => {
-  const db = freshDb();
-  addUser(db, 1);
-  db.prepare("UPDATE users SET verified_referral_count = 199 WHERE telegram_user_id = 1").run();
-  assert.equal(qualify(db, 1, 200, 10), false);
-  assert.equal(settled(db, 1).i, null, "no qualification, no settlement record");
-});
-
-test("the settled figure follows the configured rate", () => {
-  const db = freshDb();
-  addUser(db, 1);
-  db.prepare("UPDATE users SET verified_referral_count = 200 WHERE telegram_user_id = 1").run();
-  qualify(db, 1, 200, 25);
-  assert.equal(settled(db, 1).i, 5000, "200 x ₹25");
+  db.prepare("UPDATE users SET verified_referral_count = 150 WHERE telegram_user_id = 1").run();
+  assert.equal(qualify(db, 1, 200), false, "not enough under the old threshold");
+  assert.equal(qualify(db, 1, 100), true, "enough under the new one");
 });
 
 const payPremium = (db, id, charge) => db.prepare(SQL.markPremiumPaid).run(charge, id).changes > 0;

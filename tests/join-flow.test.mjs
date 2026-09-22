@@ -93,12 +93,12 @@ const BOT_INFO = {
   has_main_web_app: false,
 };
 
-function makeWorld({ chats = [-101, -102] } = {}) {
+function makeWorld({ chats = [-101, -102], threshold = "100" } = {}) {
   const sqlite = new DatabaseSync(":memory:");
   sqlite.exec(schema);
   for (const id of chats) {
     sqlite
-      .prepare("INSERT INTO required_chats (chat_id, title, kind, invite_link) VALUES (?, ?, 'group', ?)")
+      .prepare("INSERT INTO required_chats (chat_id, title, kind, invite_link) VALUES (?, ?, 'channel', ?)")
       .run(id, `Chat${-id}`, `https://t.me/+link${-id}`);
   }
   dbmod.invalidateRequiredChatCache();
@@ -111,9 +111,8 @@ function makeWorld({ chats = [-101, -102] } = {}) {
     BOT_USERNAME: "Testbot",
     PREMIUM_GROUP_CHAT_ID: "-999",
     ADMIN_IDS: "999",
-    QUALIFY_THRESHOLD: "200",
+    QUALIFY_THRESHOLD: threshold,
     PREMIUM_PRICE_STARS: "1500",
-    REFERRAL_REWARD_INR: "10",
   };
 
   const w = {
@@ -134,6 +133,22 @@ function makeWorld({ chats = [-101, -102] } = {}) {
       const status = w.members[`${payload.chat_id}:${payload.user_id}`] ?? "left";
       const user = { id: payload.user_id, is_bot: false, first_name: `User${payload.user_id}` };
       return { ok: true, result: status === "restricted" ? { status, user, is_member: true } : { status, user } };
+    }
+    if (method === "getChat") {
+      if (w.unreadable?.has(payload.chat_id)) throw new Error("Bad Request: chat not found");
+      return { ok: true, result: { id: payload.chat_id, type: "channel", title: `Chan${-payload.chat_id}` } };
+    }
+    if (method === "createChatInviteLink") {
+      return {
+        ok: true,
+        result: {
+          invite_link: `https://t.me/+minted${-payload.chat_id}`,
+          creator: { id: BOT_INFO.id, is_bot: true, first_name: "Test" },
+          creates_join_request: true,
+          is_primary: false,
+          is_revoked: false,
+        },
+      };
     }
     if (method === "sendMessage") {
       return { ok: true, result: { message_id: 1, date: 0, chat: { id: payload.chat_id, type: "private" } } };
@@ -179,10 +194,31 @@ function makeWorld({ chats = [-101, -102] } = {}) {
           message: { message_id: 1, date: tick(), chat: dm(uid) },
         },
       }),
+    press: (uid, data) =>
+      send({
+        callback_query: {
+          id: `cb${updateId}`,
+          from: person(uid),
+          chat_instance: "ci",
+          data,
+          message: { message_id: 1, date: tick(), chat: dm(uid) },
+        },
+      }),
+    say: (uid, text) =>
+      send({
+        message: {
+          message_id: updateId,
+          date: tick(),
+          chat: dm(uid),
+          from: person(uid),
+          text,
+          entities: [{ type: "bot_command", offset: 0, length: text.split(" ")[0].length }],
+        },
+      }),
     joinRequest: (uid, chatId, date = tick()) =>
       send({
         chat_join_request: {
-          chat: { id: chatId, type: "supergroup", title: `Chat${-chatId}` },
+          chat: { id: chatId, type: "channel", title: `Chat${-chatId}` },
           from: person(uid),
           user_chat_id: uid,
           date,
@@ -191,7 +227,7 @@ function makeWorld({ chats = [-101, -102] } = {}) {
     chatMember: (uid, chatId, status, date = tick(), extra = {}) =>
       send({
         chat_member: {
-          chat: { id: chatId, type: "supergroup", title: `Chat${-chatId}` },
+          chat: { id: chatId, type: "channel", title: `Chat${-chatId}` },
           from: person(999),
           date,
           old_chat_member: { status: "left", user: person(uid) },
@@ -638,6 +674,213 @@ await test("membership changes in a chat that is not required are ignored", asyn
   await w.start(2);
   await w.chatMember(2, -777, "member");
   assert.equal(w.state(2, -777), null);
+});
+
+// =============================================================================
+console.log("\nRotating the required list keeps earned verification");
+
+/** Retires the old required chats and requires the new ones, as /removechat and /addchat do. */
+function swapChats(w, oldIds, newIds) {
+  for (const id of oldIds) w.sqlite.prepare("UPDATE required_chats SET active = 0 WHERE chat_id = ?").run(id);
+  for (const id of newIds) {
+    w.sqlite
+      .prepare("INSERT INTO required_chats (chat_id, title, kind, invite_link) VALUES (?, ?, 'channel', ?)")
+      .run(id, `Chan${-id}`, `https://t.me/+c${-id}`);
+  }
+  dbmod.invalidateRequiredChatCache();
+}
+
+await test("swapping the required chats does not un-verify anyone or cost a referrer a credit", async () => {
+  const w = makeWorld({ chats: [-101, -102] });
+  const { A, B } = await referredUser(w);
+  await w.contact(B);
+  await w.joinRequest(B, -101);
+  await w.joinRequest(B, -102);
+  assert.equal(w.count(A), 1);
+
+  swapChats(w, [-101, -102], [-201, -202]);
+
+  // Every way B can touch the bot after the swap.
+  await w.start(B);
+  await w.verify(B);
+  await w.contact(B);
+  await w.start(B);
+  assert.equal(w.verified(B), true, "B was verified under the old list and stays verified");
+  assert.equal(w.count(A), 1, "the referrer keeps the credit");
+});
+
+await test("after the swap, a brand-new user must request every new channel", async () => {
+  const w = makeWorld({ chats: [-101, -102] });
+  await w.start(1);
+  swapChats(w, [-101, -102], [-201, -202]);
+  await w.start(3, w.user(1).referral_code);
+  await w.contact(3);
+  await w.joinRequest(3, -201);
+  assert.equal(w.verified(3), false, "one new channel outstanding");
+  await w.joinRequest(3, -202);
+  assert.equal(w.verified(3), true);
+  assert.equal(w.count(1), 1);
+});
+
+await test("a grandfathered user who joins a new channel and later leaves it is un-verified once", async () => {
+  const w = makeWorld({ chats: [-101, -102] });
+  const { A, B } = await referredUser(w);
+  await w.contact(B);
+  await w.joinRequest(B, -101);
+  await w.joinRequest(B, -102);
+  swapChats(w, [-101, -102], [-201, -202]);
+
+  await w.joinRequest(B, -201); // starts following the new list
+  assert.equal(w.verified(B), true);
+  const left = w.tick();
+  await w.chatMember(B, -201, "left", left);
+  await w.chatMember(B, -201, "left", left); // duplicate delivery
+  assert.equal(w.verified(B), false, "a real departure still ends the credit");
+  assert.equal(w.count(A), 0, "and only once");
+});
+
+// =============================================================================
+console.log("\nThe requirement is a plain count -- no money anywhere");
+
+/** Everything the bot sent to anyone, in one string. */
+const allText = (w) =>
+  w.calls.filter((c) => c.method === "sendMessage").map((c) => c.payload.text).join("\n");
+const MONEY = /₹|rupee|\bearn|income|settled/i;
+
+await test("reaching the threshold qualifies the referrer once, and no message mentions money", async () => {
+  const w = makeWorld({ chats: [-101], threshold: "2" });
+  await w.start(1);
+  for (const uid of [2, 3, 4]) {
+    await w.start(uid, w.user(1).referral_code);
+    await w.contact(uid);
+    await w.joinRequest(uid, -101);
+  }
+  assert.equal(w.count(1), 3);
+  assert.equal(w.user(1).qualified, 1, "qualified when the count reached the threshold");
+  assert.equal(w.user(1).reward_settled_inr, null, "nothing monetary is recorded");
+  assert.equal(w.texts(1).filter((t) => /Congratulations/.test(t)).length, 1, "announced once, not again for the third referral");
+  assert.equal(w.called("sendInvoice").length, 1, "one premium invoice");
+  assert.doesNotMatch(allText(w), MONEY);
+});
+
+await test("the menus and status screens show the count against the requirement, never money", async () => {
+  const w = makeWorld({ chats: [-101], threshold: "100" });
+  await w.start(1);
+  await w.contact(1);
+  await w.joinRequest(1, -101); // verified, so the menu is available
+  await w.press(1, "menu:referrals");
+  await w.press(1, "menu:status");
+  await w.say(1, "/status");
+  await w.say(999, "/referrals 1"); // the admin view
+  const text = allText(w);
+  assert.match(text, /Counted referrals: 0/);
+  assert.match(text, /Needed for premium: 100/);
+  assert.match(text, /100 more verified referrals to unlock premium/);
+  assert.doesNotMatch(text, MONEY);
+});
+
+// =============================================================================
+console.log("\nSwapping groups for channels through the admin commands");
+
+const ADMIN = 999;
+const chatRows = (w) =>
+  w.sqlite.prepare("SELECT chat_id, kind, active, invite_link FROM required_chats ORDER BY chat_id DESC").all();
+
+await test("/addchat registers a channel and mints an approval-required link for it", async () => {
+  const w = makeWorld({ chats: [] });
+  await w.say(ADMIN, "/addchat -1009001");
+  const [row] = chatRows(w);
+  assert.equal(row.chat_id, -1009001);
+  assert.equal(row.kind, "channel");
+  assert.equal(row.active, 1);
+  assert.match(row.invite_link, /^https:\/\/t\.me\/\+/);
+  const minted = w.called("createChatInviteLink");
+  assert.equal(minted.length, 1);
+  assert.equal(minted[0].payload.creates_join_request, true, "people must request to join, never join freely");
+  assert.match(w.lastText(ADMIN), /Added .*\(channel\)/);
+});
+
+await test("/addchat tells the admin to use the chat-ID form for a channel", async () => {
+  const w = makeWorld({ chats: [] });
+  await w.say(ADMIN, "/addchat");
+  assert.match(w.lastText(ADMIN), /always use this form for a channel/);
+});
+
+await test("a channel the bot cannot see is refused, and nothing is recorded", async () => {
+  const w = makeWorld({ chats: [] });
+  w.unreadable = new Set([-1009001]);
+  await w.say(ADMIN, "/addchat -1009001");
+  assert.match(w.lastText(ADMIN), /Could not read chat/);
+  assert.equal(chatRows(w).length, 0);
+});
+
+await test("/removechat retires a chat, keeps its history, and says verified users are unaffected", async () => {
+  const w = makeWorld({ chats: [-101] });
+  await w.say(ADMIN, "/removechat -101");
+  assert.equal(chatRows(w)[0].active, 0, "kept as history, not deleted");
+  assert.match(w.lastText(ADMIN), /Already-verified users keep their status/);
+});
+
+await test("only an admin can change the required list", async () => {
+  const w = makeWorld({ chats: [-101] });
+  await w.say(555, "/addchat -1009001");
+  await w.say(555, "/removechat -101");
+  assert.equal(chatRows(w).length, 1);
+  assert.equal(chatRows(w)[0].active, 1);
+  assert.equal(w.called("createChatInviteLink").length, 0);
+});
+
+await test("the full swap: groups out, channels in, earned verification survives, newcomers join the channels", async () => {
+  const w = makeWorld({ chats: [-101, -102] }); // the old groups
+  const { A, B } = await referredUser(w);
+  await w.contact(B);
+  await w.joinRequest(B, -101);
+  await w.joinRequest(B, -102);
+  assert.equal(w.count(A), 1);
+
+  await w.say(ADMIN, "/addchat -1009001");
+  await w.say(ADMIN, "/addchat -1009002");
+  await w.say(ADMIN, "/removechat -101");
+  await w.say(ADMIN, "/removechat -102");
+
+  await w.start(B);
+  await w.verify(B);
+  assert.equal(w.verified(B), true, "B keeps the status earned under the old groups");
+  assert.equal(w.count(A), 1, "and A keeps the credit");
+
+  // A newcomer is offered the two channels and nothing else.
+  await w.start(3, w.user(A).referral_code);
+  const shown = JSON.stringify(
+    w.calls.filter((c) => c.method === "sendMessage" && c.payload.chat_id === 3).at(-1).payload.reply_markup
+  );
+  assert.match(shown, /minted1009001/);
+  assert.match(shown, /minted1009002/);
+  assert.doesNotMatch(shown, /link101|link102/, "the retired groups are no longer offered");
+
+  await w.contact(3);
+  await w.joinRequest(3, -1009001);
+  assert.equal(w.verified(3), false, "one channel still outstanding");
+  await w.joinRequest(3, -1009002);
+  assert.equal(w.verified(3), true);
+  assert.equal(w.count(A), 2);
+  assert.equal(w.called("approveChatJoinRequest").length, 0, "the channel admin approves, never the bot");
+});
+
+await test("every admin text command still fires (regression: message:text must not swallow commands)", async () => {
+  // message:text is registered before these bot.command() handlers. If it ever
+  // stops calling next() for a "/" message again, all of these go silently dead
+  // -- with no error, so nothing but a live test catches it.
+  const w = makeWorld({ chats: [-101] });
+  await w.say(ADMIN, "/chats");
+  assert.match(w.lastText(ADMIN), /Required chats/);
+  await w.say(ADMIN, "/stats");
+  assert.match(w.lastText(ADMIN), /Stats/);
+  await w.say(ADMIN, "/referrals 1");
+  assert.match(w.lastText(ADMIN), /No such user\.|Counted referrals/);
+  await w.say(ADMIN, "/resendpremium 1");
+  assert.match(w.lastText(ADMIN), /Could not issue a link|Sent\./);
+  await w.say(ADMIN, "/refund 1");
+  assert.notEqual(w.lastText(ADMIN), "", "the refund handler must have replied with something");
 });
 
 // =============================================================================

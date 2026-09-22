@@ -15,8 +15,6 @@ export interface UserRow {
   verified_referral_count: number;
   qualified: number;
   qualified_at: string | null;
-  reward_settled_inr: number | null;
-  reward_settled_at: string | null;
   premium_paid: number;
   premium_paid_at: string | null;
   premium_charge_id: string | null;
@@ -426,10 +424,19 @@ export async function tryClaimVerification(db: D1Database, userId: number): Prom
 
 /**
  * The mirror image of tryClaimVerification: drops verified 1->0 in one
- * statement when the user no longer satisfies every active required chat (no
- * pending request and no membership). Returns true only for the call that performed the
- * transition, so exactly one caller decrements the referrer -- the same
- * discipline that stops the increment double-counting.
+ * statement when the user has LEFT (or been removed from) an active required
+ * chat, i.e. this bot holds a recorded departure ('ended') for it. Returns true
+ * only for the call that performed the transition, so exactly one caller
+ * decrements the referrer -- the same discipline that stops the increment
+ * double-counting.
+ *
+ * Deliberately NOT "the user fails to satisfy every active chat". That reading
+ * would un-verify every already-verified user, and cost each of their referrers
+ * a credit, the first time they opened the bot after an admin added or swapped
+ * a required chat. It contradicts the promise that rotating the list never
+ * strips earned status (see /removechat and the README). Claiming verification
+ * still requires every active chat; keeping it requires only that they have not
+ * left one.
  */
 export async function tryRevokeVerification(db: D1Database, userId: number): Promise<VerificationChange> {
   const row = await db
@@ -440,11 +447,10 @@ export async function tryRevokeVerification(db: D1Database, userId: number): Pro
          AND verified = 1
          AND EXISTS (
                SELECT 1 FROM required_chats rc
+               JOIN join_requests jr ON jr.chat_id = rc.chat_id
                WHERE rc.active = 1
-                 AND NOT EXISTS (
-                       SELECT 1 FROM join_requests jr
-                       WHERE jr.telegram_user_id = ? AND jr.chat_id = rc.chat_id AND jr.status IN ('pending', 'member')
-                     )
+                 AND jr.telegram_user_id = ?
+                 AND jr.status = 'ended'
              )
        RETURNING referred_by`
     )
@@ -473,32 +479,25 @@ export async function incrementVerifiedReferralCount(db: D1Database, referrerId:
 
 /**
  * Atomically claims qualification for a referrer who has reached the
- * threshold, and freezes the rupee figure in the same statement.
+ * threshold. Qualifying is a plain requirement -- it unlocks the premium
+ * opportunity -- and carries no monetary figure.
  *
  * Uses `>=` rather than an exact match and reads the count inside the same
  * statement that flips the flag, so a concurrent increment can never cause the
- * threshold crossing to be missed or double-counted.
- *
- * The snapshot is taken here rather than by a later read because this is the
- * instant the money is owed. Computing it in the same UPDATE means the count it
- * is based on cannot shift between the check and the capture, and because the
- * statement only ever fires once per user, the settled figure is written once
- * and never moves again -- even as the live figure erodes when referrals leave.
+ * threshold crossing to be missed or double-counted. The statement only ever
+ * fires once per user.
  */
 export async function tryClaimQualification(
   db: D1Database,
   userId: number,
-  threshold: number,
-  rewardPerReferral: number
+  threshold: number
 ): Promise<boolean> {
   const res = await db
     .prepare(
-      `UPDATE users SET qualified = 1, qualified_at = datetime('now'),
-              reward_settled_inr = MIN(verified_referral_count, ?) * ?,
-              reward_settled_at = datetime('now')
+      `UPDATE users SET qualified = 1, qualified_at = datetime('now')
        WHERE telegram_user_id = ? AND qualified = 0 AND verified_referral_count >= ?`
     )
-    .bind(threshold, rewardPerReferral, userId, threshold)
+    .bind(userId, threshold)
     .run();
   return (res.meta.changes ?? 0) > 0;
 }

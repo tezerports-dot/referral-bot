@@ -1,8 +1,8 @@
 # Referral / Verification Bot
 
 Cloudflare Workers + D1. Users verify by sharing contact and sending join
-requests to an **admin-managed list of groups/channels** (any number, changeable
-at runtime). **200** verified direct referrals unlock the Premium Opportunity,
+requests to an **admin-managed list of channels** (any number, changeable
+at runtime). **100** verified direct referrals unlock the Premium Opportunity,
 which is then purchased with **1500 Telegram Stars**.
 
 ## Upgrading from the previous version
@@ -68,7 +68,7 @@ is re-registered — recoverable (Telegram retries), but avoidable.
 required list is managed at runtime with `/addchat` and `/removechat` — no
 redeploy to change it.
 
-## Managing the required groups and channels
+## Managing the required channels
 
 There is no fixed number and no redeploy needed. As an admin, DM the bot:
 
@@ -76,7 +76,7 @@ There is no fixed number and no redeploy needed. As an admin, DM the bot:
 |---|---|
 | `/chats` | List every required chat, active and removed, with invite links |
 | `/addchat <chat_id>` | Add (or re-activate) a chat |
-| `/addchat` | Same, but sent *inside* the group you want to add |
+| `/addchat` | Same, but sent *inside* a group you want to add (not possible in a channel — use the chat ID) |
 | `/removechat <chat_id>` | Stop requiring a chat |
 
 When you add a chat the bot calls `getChat` to confirm it can see it, then
@@ -101,6 +101,26 @@ and a ready-to-paste `/addchat` command automatically.
   list.
 - An **empty** list verifies nobody. This is deliberate — a bug that cleared
   the list would otherwise verify your entire user base at once.
+
+### Using channels instead of groups
+
+Channels work exactly like groups here: the same `/addchat`, the same
+approval-required links and the same join-request handling. To move from groups
+to channels:
+
+1. Create each channel and make it **private** (no public @username). A public
+   channel can be joined straight from its username link, which skips the
+   approval-required link the bot issues.
+2. Add the bot as an **administrator** of the channel with *Invite Users via
+   Link*. The bot DMs the admins the channel's ID and a ready-to-paste
+   `/addchat` command.
+3. DM the bot `/addchat <chat_id>` for each channel. Commands cannot be sent
+   inside a channel, so always use the chat-ID form.
+4. Once the channels are added, send `/removechat <chat_id>` for each old group.
+
+Users who were verified under the old groups stay verified: swapping the list
+never un-verifies anyone or costs a referrer a credit. Only people who are not
+yet verified need to send join requests to the new channels.
 
 ## Join requests: manual approval, and a pending request counts
 
@@ -206,7 +226,7 @@ Telegram's webhook retries safe.
 
 Users can check where they stand at any time with `/status`.
 
-## Premium: 200 referrals, 1500 Stars
+## Premium: 100 referrals, 1500 Stars
 
 At `QUALIFY_THRESHOLD` verified referrals the referrer is marked qualified and
 sent a Telegram Stars invoice for `PREMIUM_PRICE_STARS`. On successful payment
@@ -214,6 +234,11 @@ the bot mints a **single-use** invite link to `PREMIUM_GROUP_CHAT_ID` and DMs
 it. Admins get a draft announcement to review — it is never auto-posted.
 
 Both numbers are `[vars]` in `wrangler.toml`; change them and redeploy.
+
+The requirement is a plain count. There is no rupee figure, per-referral rate or
+earnings cap anywhere in the bot, and the `REFERRAL_REWARD_INR` variable no
+longer exists. (The `reward_settled_*` columns from earlier versions are kept as
+history; nothing reads or writes them.)
 
 Qualification is claimed with `verified_referral_count >= threshold` inside the
 same statement that sets the flag, so a count that overshoots the threshold (a

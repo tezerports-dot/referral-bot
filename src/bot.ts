@@ -1,7 +1,7 @@
 import { Bot, InlineKeyboard } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
 import type { Env } from "./types";
-import { premiumPriceStars, qualifyThreshold, referralRewardInr, rewardCapInr, rewardInr } from "./types";
+import { premiumPriceStars, qualifyThreshold } from "./types";
 import { normalizePhone, phoneTail } from "./phone";
 import {
   addRequiredChat,
@@ -50,30 +50,6 @@ function contactKeyboard() {
     resize_keyboard: true,
     one_time_keyboard: true,
   };
-}
-
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-/** SQLite's "2026-09-17 11:47:28" -> "17 Sep 2026". */
-function shortDate(ts: string | null): string {
-  if (!ts) return "";
-  const d = new Date(ts.replace(" ", "T") + "Z");
-  if (Number.isNaN(d.getTime())) return ts;
-  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
-}
-
-/**
- * Both figures once a user has qualified: what they are worth now, and the
- * amount frozen when they hit the threshold. They diverge when referrals
- * leave, and that divergence is the point -- the settled figure is what is
- * owed, so a dispute has a single unambiguous answer.
- */
-function earningsLine(env: Env, user: UserRow): string {
-  const live = rewardInr(env, user.verified_referral_count);
-  if (user.reward_settled_inr === null || user.reward_settled_at === null) {
-    return `Earned: ₹${live} of ₹${rewardCapInr(env)}`;
-  }
-  return `Earned: ₹${live} · settled ₹${user.reward_settled_inr} on ${shortDate(user.reward_settled_at)}`;
 }
 
 function displayName(u: UserRow | null): string {
@@ -142,7 +118,6 @@ async function progressText(env: Env, userId: number, preloaded?: UserRow | null
     return (
       "✅ You are verified.\n\n" +
       `Counted referrals: ${user.verified_referral_count} / ${threshold}\n` +
-      `${earningsLine(env, user)}\n` +
       (user.qualified
         ? user.premium_paid
           ? "Premium: paid — your invite link has been sent."
@@ -236,10 +211,10 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     await ctx.reply(text, { reply_markup: kb });
   }
 
-  bot.on("message:text", async (ctx) => {
+  bot.on("message:text", async (ctx, next) => {
     const from = ctx.from;
     const text = ctx.message.text.trim();
-    if (!from || !priv(ctx) || text.startsWith("/")) return;
+    if (!from || !priv(ctx) || text.startsWith("/")) return next();
 
     const user = await getUserById(env.DB, from.id);
     if (!user) {
@@ -338,17 +313,10 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
         await ctx.reply(
           "📊 Your referrals\n\n" +
             `Counted referrals: ${user.verified_referral_count}\n` +
-            `${earningsLine(env, user)}\n` +
-            `Rate: ₹${referralRewardInr(env)} per referral\n\n` +
             `Needed for premium: ${threshold}\n` +
             (user.qualified ? "Status: unlocked ⭐" : `Still needed: ${remaining}`) +
-            "\n\nOnly members who stay in every group and channel are counted. " +
-            `If someone leaves, they stop counting and ₹${referralRewardInr(env)} comes off. ` +
-            `₹${rewardCapInr(env)} is the maximum any account can earn.` +
-            (user.reward_settled_inr !== null
-              ? `\n\nYour ₹${user.reward_settled_inr} was settled on ${shortDate(user.reward_settled_at)} ` +
-                "and does not change after that."
-              : "")
+            "\n\nOnly people who stay in every required channel are counted. " +
+            "If someone leaves, they stop counting."
         );
         return;
       }
@@ -360,7 +328,6 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
             `Contact shared: ${user.contact_shared ? "yes" : "no"}\n` +
             `Referred by: ${user.referred_by ? displayName(await getUserById(env.DB, user.referred_by)) : "nobody"}\n` +
             `Counted referrals: ${user.verified_referral_count}\n` +
-            `${earningsLine(env, user)}\n` +
             `Premium: ${user.premium_paid ? "paid" : user.qualified ? "unlocked, not paid" : "locked"}\n` +
             `Joined: ${user.created_at}`
         );
@@ -494,7 +461,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
 
     if (!Number.isInteger(chatId)) {
       await ctx.reply(
-        "Usage:\n• /addchat <chat_id> — from this DM\n• /addchat — sent inside the group you want to add\n\n" +
+        "Usage:\n• /addchat <chat_id> — from this DM (always use this form for a channel)\n• /addchat — sent inside a group you want to add\n\n" +
           "The bot must already be an admin there with 'Invite Users via Link'."
       );
       return;
@@ -593,7 +560,6 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
     const referrals = await getDirectReferrals(env.DB, targetId, 100);
     await ctx.reply(
       `User ${targetId}\nCounted referrals: ${user.verified_referral_count}\n` +
-        `${earningsLine(env, user)}\n` +
         `Qualified: ${user.qualified ? "yes" : "no"}\nPremium paid: ${user.premium_paid ? "yes" : "no"}\n` +
         `Direct referrals fetched: ${referrals.length} (verified among these: ${referrals.filter((r) => r.verified).length})`
     );

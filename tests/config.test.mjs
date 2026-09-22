@@ -89,7 +89,6 @@ test("[vars] contains only the expected non-secret keys", () => {
     "ADMIN_IDS",
     "QUALIFY_THRESHOLD",
     "PREMIUM_PRICE_STARS",
-    "REFERRAL_REWARD_INR",
   ]);
   const unexpected = varNames.filter((n) => !allowed.has(n));
   assert.deepEqual(
