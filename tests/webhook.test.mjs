@@ -50,41 +50,81 @@ const stripComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|
 const srcFiles = walk(join(root, "src")).filter((f) => f.endsWith(".ts"));
 
 // =============================================================================
-console.log("\nTest 7 — join requests are never approved automatically");
+console.log("\nTest 7 — the bot approves ONLY in a chat an admin designated with /autojoin");
 
-test("approveChatJoinRequest does not appear anywhere in src/", () => {
-  const hits = srcFiles.filter((f) => /approveChatJoinRequest/i.test(readFileSync(f, "utf8")));
-  assert.deepEqual(hits.map((f) => relative(root, f)), []);
+// The rule used to be "the bot never approves, full stop". It is now narrower:
+// approval is allowed in exactly one place, behind an explicit per-chat flag an
+// admin sets with /autojoin. These tests pin that narrowing down rather than
+// dropping the guarantee -- an approval call anywhere else still fails.
+
+/** The chat_join_request handler body, and everything else, separately. */
+function splitBot() {
+  const code = stripComments(read("src/bot.ts"));
+  const from = code.indexOf('bot.on("chat_join_request"');
+  const to = code.indexOf("bot.on(", from + 1);
+  assert.ok(from > -1 && to > from, "could not isolate the chat_join_request handler");
+  return { handler: code.slice(from, to), rest: code.slice(0, from) + code.slice(to) };
+}
+
+test("approveChatJoinRequest appears in src/bot.ts and nowhere else", () => {
+  const hits = srcFiles
+    .filter((f) => /approveChatJoinRequest/.test(readFileSync(f, "utf8")))
+    .map((f) => relative(root, f));
+  assert.deepEqual(hits, ["src/bot.ts"]);
 });
 
-test("no code in src/ calls any approve*() method or wrapper", () => {
+test("there is exactly one approval call, and it is behind the auto-approve guard", () => {
+  const { handler } = splitBot();
+  const approvals = [...handler.matchAll(/\bapproveChatJoinRequest\s*\(/g)];
+  assert.equal(approvals.length, 1, "expected exactly one approval call in the handler");
+  const guard = handler.indexOf("policy.autoApprove");
+  assert.ok(guard > -1, "the handler must read policy.autoApprove");
+  assert.ok(
+    guard < approvals[0].index,
+    "the approval must sit after the policy.autoApprove check, not on the normal path"
+  );
+});
+
+test("nothing outside that handler approves anyone", () => {
+  // setChatAutoApprove only writes the flag; it approves nobody.
+  const CONFIG_ONLY = new Set(["setChatAutoApprove"]);
   const calls = [];
   for (const f of srcFiles) {
-    const code = stripComments(readFileSync(f, "utf8"));
-    for (const m of code.matchAll(/\b(\w*[aA]pprove\w*)\s*\(/g)) calls.push(`${relative(root, f)}: ${m[1]}(`);
-  }
-  assert.deepEqual(calls, [], "something approves users; the admin must do that");
-});
-
-test("the chat_join_request handler makes no approval decision", () => {
-  const bot = stripComments(read("src/bot.ts"));
-  const start = bot.indexOf('bot.on("chat_join_request"');
-  const end = bot.indexOf("bot.on(", start + 1);
-  assert.ok(start > -1 && end > start, "could not isolate the chat_join_request handler");
-  const handler = bot.slice(start, end);
-  assert.ok(!/approve/i.test(handler), "the handler references approval");
-  // What it MAY do: record the request, and refuse people who skipped the bot.
-  assert.ok(/recordJoinRequest/.test(handler), "the handler must record the request");
-});
-
-test("the docs no longer promise automatic approval", () => {
-  const promises = [];
-  for (const rel of ["README.md", "src/bot.ts"]) {
-    for (const line of read(rel).split("\n")) {
-      if (/approv\w*\s+automatically|automatically\s+approv/i.test(line)) promises.push(`${rel}: ${line.trim()}`);
+    const rel = relative(root, f);
+    const scan = rel === "src/bot.ts" ? splitBot().rest : stripComments(readFileSync(f, "utf8"));
+    for (const m of scan.matchAll(/\b(\w*[aA]pprove\w*)\s*\(/g)) {
+      if (!CONFIG_ONLY.has(m[1])) calls.push(`${rel}: ${m[1]}(`);
     }
   }
-  assert.deepEqual(promises, []);
+  assert.deepEqual(calls, [], "approval must happen only in the designated-chat branch");
+});
+
+test("the manual path is intact: it still records and still declines", () => {
+  const { handler } = splitBot();
+  assert.ok(/recordJoinRequest/.test(handler), "the handler must record the request");
+  assert.ok(/declineChatJoinRequest/.test(handler), "non-bot users must still be declined");
+});
+
+test("the docs promise automatic approval only for a designated chat", () => {
+  // Checked per paragraph, not per line: prose wraps, and a promise qualified
+  // in the sentence before is qualified. A bare promise in its own paragraph,
+  // with no mention of the opt-in anywhere near it, is what this catches.
+  const PROMISE = /approv\w*\s+automatically|automatically\s+approv|auto-approve/i;
+  const QUALIFIER = /autojoin|designat|auto_approve|autoApprove|⚡/i;
+
+  const unqualified = [];
+  for (const rel of ["README.md", "src/bot.ts"]) {
+    const text = read(rel);
+    // Markdown wraps across lines, so judge a whole paragraph; a string literal
+    // in source stands alone, so judge a line.
+    const blocks = rel.endsWith(".md") ? text.split(/\n\s*\n/) : text.split("\n");
+    for (const block of blocks) {
+      if (!PROMISE.test(block)) continue;
+      if (QUALIFIER.test(block)) continue;
+      unqualified.push(`${rel}: ${block.trim().split("\n")[0]}`);
+    }
+  }
+  assert.deepEqual(unqualified, [], "an unqualified promise of automatic approval is misleading");
 });
 
 // =============================================================================

@@ -62,6 +62,10 @@ CREATE TABLE IF NOT EXISTS required_chats (
   -- when the chat is added. This is what users are shown, so a plain invite
   -- link that would bypass verification never has to be circulated.
   invite_link TEXT,
+  -- 1 when the bot should approve join requests to this chat itself, instead of
+  -- recording them and leaving them pending for an admin. Off by default, and
+  -- set only by an admin running /autojoin.
+  auto_approve INTEGER NOT NULL DEFAULT 0,
   active      INTEGER NOT NULL DEFAULT 1,
   added_at    TEXT    NOT NULL DEFAULT (datetime('now')),
   added_by    INTEGER,

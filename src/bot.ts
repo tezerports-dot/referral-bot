@@ -17,7 +17,9 @@ import {
   getUserById,
   getUserByReferralCode,
   invalidateRequiredChatCache,
+  getChatPolicy,
   isRequiredChatCached,
+  setChatAutoApprove,
   listRequiredChats,
   markJoinEnded,
   markJoinMember,
@@ -370,7 +372,26 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
 
   bot.on("chat_join_request", async (ctx) => {
     const req = ctx.chatJoinRequest;
-    if (!(await isRequiredChatCached(env.DB, req.chat.id))) return;
+    const policy = await getChatPolicy(env.DB, req.chat.id);
+    if (!policy.required) return;
+
+    // A chat an admin designated with /autojoin approves every request itself,
+    // including from people who never opened the bot. This is the only place
+    // the bot approves anything; every other chat keeps the manual rule below.
+    if (policy.autoApprove) {
+      try {
+        await bot.api.approveChatJoinRequest(req.chat.id, req.from.id);
+      } catch (err) {
+        console.error(`/autojoin: failed to approve join request from ${req.from.id}:`, err);
+      }
+      // Recorded regardless, so this chat's requirement is satisfied exactly as
+      // a pending request would satisfy it. join_requests is keyed on the user
+      // id and independent of registration, so a row written now still counts
+      // if that person opens the bot later.
+      await recordJoinRequest(env.DB, req.from.id, req.chat.id, req.date);
+      await tryVerifyAndQualify(env, bot.api, req.from.id);
+      return;
+    }
 
     const user = await getUserById(env.DB, req.from.id);
 
@@ -520,6 +541,7 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
           .map(
             (c) =>
               `${c.active ? "🟢" : "⚪"} ${c.chat_id} — ${c.title ?? "(untitled)"} [${c.kind}]` +
+              (c.auto_approve ? "  ⚡ auto-approve" : "") +
               (c.invite_link ? `\n   ${c.invite_link}` : "\n   (no invite link)")
           )
           .join("\n")
@@ -527,6 +549,56 @@ export function createBot(env: Env, botInfo?: UserFromGetMe): Bot {
   });
 
   // ---- Admin: stats and support ----
+
+  bot.command("autojoin", async (ctx) => {
+    if (!isAdmin(env, ctx.from?.id)) return;
+
+    const parts = (ctx.match?.toString().trim() ?? "").split(/\s+/).filter(Boolean);
+    const mode = parts[0]?.toLowerCase();
+    const inTargetChat = ctx.chat && ctx.chat.type !== "private";
+
+    if (mode !== "on" && mode !== "off") {
+      const chats = await listRequiredChats(env.DB, true);
+      const on = chats.filter((c) => c.auto_approve);
+      await ctx.reply(
+        "Auto-approve join requests for one designated chat.\n\n" +
+          "/autojoin on <chat_id>\n" +
+          "/autojoin off <chat_id>\n" +
+          "(or send /autojoin on inside the chat itself)\n\n" +
+          (on.length
+            ? "Currently on for:\n" + on.map((c) => `⚡ ${c.chat_id} — ${c.title ?? "(untitled)"}`).join("\n")
+            : "Currently off for every chat — all join requests wait for an admin.") +
+          "\n\nEvery other chat keeps the normal rule: requests are recorded and left " +
+          "pending for you, and anyone who did not come through the bot is declined."
+      );
+      return;
+    }
+
+    // Second word is the chat id; without one, the chat this was sent in.
+    const chatId = parts[1] ? Number(parts[1]) : inTargetChat ? ctx.chat!.id : NaN;
+    if (!Number.isInteger(chatId)) {
+      await ctx.reply("Usage: /autojoin on <chat_id>   (see /chats for the ids)");
+      return;
+    }
+
+    const changed = await setChatAutoApprove(env.DB, chatId, mode === "on");
+    invalidateRequiredChatCache();
+    if (!changed) {
+      await ctx.reply(`${chatId} is not in the active required list. Add it with /addchat first, then retry.`);
+      return;
+    }
+
+    await ctx.reply(
+      mode === "on"
+        ? `⚡ /autojoin is ON for ${chatId}.\n\n` +
+            "Every join request to that chat is now approved by the bot immediately, " +
+            "including from people who never opened the bot.\n\n" +
+            "Your other chats are unchanged: their requests are still recorded and left " +
+            "pending for you, and non-bot users are still declined."
+        : `/autojoin is OFF for ${chatId}.\n\n` +
+            "Its join requests go back to waiting for an admin, and non-bot users are declined again."
+    );
+  });
 
   bot.command("stats", async (ctx) => {
     if (!isAdmin(env, ctx.from?.id)) return;

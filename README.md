@@ -78,6 +78,9 @@ There is no fixed number and no redeploy needed. As an admin, DM the bot:
 | `/addchat <chat_id>` | Add (or re-activate) a chat |
 | `/addchat` | Same, but sent *inside* a group you want to add (not possible in a channel — use the chat ID) |
 | `/removechat <chat_id>` | Stop requiring a chat |
+| `/autojoin on <chat_id>` | Let the bot approve that chat's join requests itself |
+| `/autojoin off <chat_id>` | Put that chat back to manual approval |
+| `/autojoin` | Show which chat, if any, is designated |
 
 When you add a chat the bot calls `getChat` to confirm it can see it, then
 mints an **approval-required invite link** itself (`creates_join_request`) and
@@ -204,6 +207,33 @@ documented; do not rely on it.
 nothing here *depends* on it: verification works from pending requests alone, and
 membership is reconciled by lookup when it matters.
 
+## Designating one chat for automatic approval
+
+By default the bot never approves anyone: it records each join request, leaves
+it pending for an admin, and declines anyone who did not come through the bot.
+
+`/autojoin on <chat_id>` makes one chat an exception — the bot approves every
+request to it immediately. `/chats` marks that chat with ⚡.
+
+Two things to be clear about before turning it on:
+
+- **That chat stops being gated behind the bot.** Automatic approval means
+  everyone is approved, including people who never opened the bot. That is what
+  "approve all join requests" means; there is no way to auto-approve only
+  bot users, because deciding requires knowing who they are.
+- **Your other chats are unaffected.** They still record requests, still leave
+  them for you, and still decline outsiders. So verification as a whole stays
+  gated: someone who skipped the bot can walk into the designated chat, but
+  they cannot satisfy the others.
+
+A request auto-approved in the designated chat counts toward that chat's
+requirement exactly like a pending one, and the row is written even for someone
+with no account yet — so if they open the bot later, that chat is already
+ticked off.
+
+`/autojoin off <chat_id>` reverts it.
+
+
 ## How verification works
 
 A user becomes verified only when a single atomic `UPDATE` finds all of:
@@ -258,6 +288,7 @@ retries delivery without charging again.
 | `/stats` | Registered / verified / qualified / paid counts, required-chat count, price |
 | `/referrals <user_id>` | One user's count, qualified and paid status, direct referrals |
 | `/chats`, `/addchat`, `/removechat` | Manage the required list (above) |
+| `/autojoin on\|off <chat_id>` | Designate one chat whose join requests the bot approves itself |
 | `/resendpremium <user_id>` | Re-issue a paid user's invite link |
 | `/refund <user_id>` | Refund their Stars payment and reset their premium state |
 
