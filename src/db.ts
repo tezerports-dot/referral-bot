@@ -27,6 +27,7 @@ export interface RequiredChatRow {
   title: string | null;
   kind: string;
   invite_link: string | null;
+  auto_approve: number;
   active: number;
   added_at: string;
   added_by: number | null;
@@ -192,24 +193,66 @@ export async function deactivateRequiredChat(db: D1Database, chatId: number): Pr
  * required_chats live, so a lingering row cannot make anyone verified.
  */
 const REQUIRED_CHAT_TTL_MS = 60_000;
-let requiredChatCache: { ids: Set<number>; at: number } | null = null;
+/** chat_id -> auto_approve, for every active required chat. */
+let requiredChatCache: { chats: Map<number, boolean>; at: number } | null = null;
 
 export function invalidateRequiredChatCache(): void {
   requiredChatCache = null;
 }
 
-export async function isRequiredChatCached(db: D1Database, chatId: number): Promise<boolean> {
+export interface ChatPolicy {
+  required: boolean;
+  /** True only for a chat an admin designated with /autojoin. */
+  autoApprove: boolean;
+}
+
+/**
+ * The join-request policy for a chat, from the cache where possible.
+ *
+ * Carries auto_approve alongside membership so the join handler learns both
+ * from one lookup. A policy change made on another isolate can take up to the
+ * TTL to be seen there; /autojoin invalidates immediately on its own isolate.
+ */
+export async function getChatPolicy(db: D1Database, chatId: number): Promise<ChatPolicy> {
   const now = Date.now();
-  if (requiredChatCache && now - requiredChatCache.at <= REQUIRED_CHAT_TTL_MS) {
-    if (requiredChatCache.ids.has(chatId)) return true;
-  } else {
-    const res = await db.prepare("SELECT chat_id FROM required_chats WHERE active = 1").all<{ chat_id: number }>();
-    requiredChatCache = { ids: new Set((res.results ?? []).map((r) => r.chat_id)), at: now };
-    return requiredChatCache.ids.has(chatId);
+  const fresh = requiredChatCache !== null && now - requiredChatCache.at <= REQUIRED_CHAT_TTL_MS;
+
+  if (!fresh) {
+    const res = await db
+      .prepare("SELECT chat_id, auto_approve FROM required_chats WHERE active = 1")
+      .all<{ chat_id: number; auto_approve: number }>();
+    requiredChatCache = {
+      chats: new Map((res.results ?? []).map((r) => [r.chat_id, r.auto_approve === 1])),
+      at: now,
+    };
+    // The whole active set was just loaded, so absence from it is authoritative.
+    const loaded = requiredChatCache.chats.get(chatId);
+    return loaded === undefined ? { required: false, autoApprove: false } : { required: true, autoApprove: loaded };
   }
+
+  const hit = requiredChatCache!.chats.get(chatId);
+  if (hit !== undefined) return { required: true, autoApprove: hit };
+
   // Warm cache, no hit: confirm against the database before rejecting, so a
-  // newly added chat is never ignored.
-  return isRequiredChat(db, chatId);
+  // chat added seconds ago is never ignored.
+  const row = await db
+    .prepare("SELECT auto_approve FROM required_chats WHERE chat_id = ? AND active = 1")
+    .bind(chatId)
+    .first<{ auto_approve: number }>();
+  return row ? { required: true, autoApprove: row.auto_approve === 1 } : { required: false, autoApprove: false };
+}
+
+export async function isRequiredChatCached(db: D1Database, chatId: number): Promise<boolean> {
+  return (await getChatPolicy(db, chatId)).required;
+}
+
+/** Turns /autojoin on or off for a chat. Returns false if the chat is not in the list. */
+export async function setChatAutoApprove(db: D1Database, chatId: number, on: boolean): Promise<boolean> {
+  const res = await db
+    .prepare("UPDATE required_chats SET auto_approve = ? WHERE chat_id = ? AND active = 1")
+    .bind(on ? 1 : 0, chatId)
+    .run();
+  return (res.meta.changes ?? 0) > 0;
 }
 
 export async function isRequiredChat(db: D1Database, chatId: number): Promise<boolean> {

@@ -282,7 +282,7 @@ async function test(name, fn) {
 }
 
 // =============================================================================
-console.log("\nTest 1 — join requests are NOT auto-approved");
+console.log("\nTest 1 — join requests are NOT auto-approved, unless /autojoin designated the chat");
 
 await test("a join request is recorded as pending and approveChatJoinRequest is never called", async () => {
   const w = makeWorld();
@@ -304,7 +304,7 @@ await test("no approval is issued even for the request that completes verificati
   assert.equal(w.called("approveChatJoinRequest").length, 0);
 });
 
-await test("the tokens 'approveChatJoinRequest' / 'approve' never go out over the API for any flow", async () => {
+await test("no 'approve' call goes out for any flow through a chat that is not designated", async () => {
   const w = makeWorld();
   const { B } = await referredUser(w);
   await w.contact(B);
@@ -336,6 +336,95 @@ await test("a request for a chat that is not required is ignored entirely", asyn
 });
 
 // =============================================================================
+console.log("\nTest 1b — /autojoin: the one chat where the bot approves");
+
+/** Flip auto_approve for a chat, as the /autojoin command does. */
+function setAutoApprove(w, chatId, on) {
+  w.sqlite.prepare("UPDATE required_chats SET auto_approve = ? WHERE chat_id = ?").run(on ? 1 : 0, chatId);
+  dbmod.invalidateRequiredChatCache();
+}
+
+await test("a request to a designated chat is approved by the bot", async () => {
+  const w = makeWorld();
+  setAutoApprove(w, -101, true);
+  const { B } = await referredUser(w);
+  await w.contact(B);
+  await w.joinRequest(B, -101);
+
+  const approvals = w.called("approveChatJoinRequest");
+  assert.equal(approvals.length, 1, "the designated chat must approve");
+  assert.equal(approvals[0].payload.chat_id, -101);
+  assert.equal(approvals[0].payload.user_id, B);
+  assert.equal(w.state(B, -101), "pending", "and the request is still recorded");
+});
+
+await test("the other chats are untouched: still pending, still no approval", async () => {
+  const w = makeWorld();
+  setAutoApprove(w, -101, true);
+  const { B } = await referredUser(w);
+  await w.contact(B);
+  await w.joinRequest(B, -102);
+
+  assert.equal(w.called("approveChatJoinRequest").length, 0, "a non-designated chat must not approve");
+  assert.equal(w.state(B, -102), "pending");
+});
+
+await test("in a designated chat, even someone who never opened the bot is approved", async () => {
+  // This is the deliberate consequence of "approve all join requests": that
+  // chat is no longer gated behind the bot. The others still are.
+  const w = makeWorld();
+  setAutoApprove(w, -101, true);
+  await w.joinRequest(555, -101);
+
+  assert.equal(w.called("approveChatJoinRequest").length, 1, "the designated chat approves outsiders too");
+  assert.equal(w.called("declineChatJoinRequest").length, 0, "and does not decline them");
+});
+
+await test("a non-designated chat still declines someone who never opened the bot", async () => {
+  const w = makeWorld();
+  setAutoApprove(w, -101, true);
+  await w.joinRequest(555, -102);
+
+  assert.equal(w.called("declineChatJoinRequest").length, 1, "the gate on other chats must survive");
+  assert.equal(w.called("approveChatJoinRequest").length, 0);
+});
+
+await test("a designated chat still counts toward verification", async () => {
+  const w = makeWorld();
+  setAutoApprove(w, -101, true);
+  const { B } = await referredUser(w);
+  await w.contact(B);
+  await w.joinRequest(B, -101);
+  assert.equal(w.verified(B), false, "precondition: one chat still outstanding");
+  await w.joinRequest(B, -102);
+  assert.equal(w.verified(B), true, "an auto-approved request satisfies its chat like any other");
+});
+
+await test("turning /autojoin off restores the manual behaviour", async () => {
+  const w = makeWorld();
+  setAutoApprove(w, -101, true);
+  const { B } = await referredUser(w);
+  await w.contact(B);
+  await w.joinRequest(B, -101);
+  assert.equal(w.called("approveChatJoinRequest").length, 1, "precondition: it was approving");
+
+  setAutoApprove(w, -101, false);
+  await w.joinRequest(3, -101);
+  assert.equal(w.called("approveChatJoinRequest").length, 1, "no further approvals after switching off");
+});
+
+await test("an outsider approved into a designated chat keeps that credit if they later join the bot", async () => {
+  const w = makeWorld();
+  setAutoApprove(w, -101, true);
+  await w.joinRequest(7, -101); // approved before they ever opened the bot
+  assert.equal(w.state(7, -101), "pending", "the row is written even with no user record");
+
+  await w.start(7);
+  await w.contact(7);
+  await w.joinRequest(7, -102);
+  assert.equal(w.verified(7), true, "the earlier row still satisfies its chat");
+});
+
 console.log("\nTest 2 — a pending request satisfies the requirement");
 
 await test("with a pending request on every chat, each chat reports satisfied", async () => {
